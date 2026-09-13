@@ -976,8 +976,8 @@ const App = () => {
     if (!html) return html;
     if (window.DOMPurify) {
       return window.DOMPurify.sanitize(html, {
-        ADD_TAGS: ['input', 'table', 'thead', 'tbody', 'tr', 'td', 'th'],
-        ADD_ATTR: ['class', 'accept', 'type', 'dir', 'style', 'data-block-id', 'data-phase4-asset-index', 'colspan', 'rowspan']
+        ADD_TAGS: ['table', 'thead', 'tbody', 'tr', 'td', 'th'],
+        ADD_ATTR: ['class', 'dir', 'style', 'data-block-id', 'data-phase4-asset-index', 'colspan', 'rowspan']
       });
     }
     return html
@@ -986,71 +986,19 @@ const App = () => {
       .replace(/ on[a-z]+='[^']*'/gi, '');
   }, []);
 
-  useEffect(() => {
-    const handleFileSelect = (e) => {
-      if (e.target && e.target.classList.contains('diagram-upload-input')) {
-        const file = e.target.files[0];
-        if (!file) return;
-
-        const reader = new FileReader();
-        reader.onload = (event) => {
-          const base64 = event.target.result;
-          const liveContainer = e.target.closest('.diagram-placeholder');
-          const editorDiv = e.target.closest('[id^="translation-editor-"]');
-
-          if (liveContainer && editorDiv) {
-            const allLivePlaceholders = Array.from(editorDiv.querySelectorAll('.diagram-placeholder'));
-            const placeholderIndex = allLivePlaceholders.indexOf(liveContainer);
-
-            const detachedRoot = editorDiv.cloneNode(true);
-            const detachedPlaceholders = Array.from(detachedRoot.querySelectorAll('.diagram-placeholder'));
-            const detachedContainer = (placeholderIndex >= 0 && detachedPlaceholders[placeholderIndex])
-              ? detachedPlaceholders[placeholderIndex]
-              : (detachedRoot.querySelector('.diagram-placeholder') || detachedRoot);
-
-            // PHASE 4: preserve the original detected visual element's approximate
-            // position/size (Phase 2 metadata) on the replacement image where available,
-            // instead of only relying on the placeholder's natural document-flow position.
-            const pageIdForAsset = parseInt(editorDiv.id.replace('translation-editor-', ''), 10);
-            const pageForAsset = window.__phase4ParsedSectionsRef
-              ? window.__phase4ParsedSectionsRef.find(s => s.id === pageIdForAsset)
-              : null;
-            const assetMeta = pageForAsset?.structure?.visualAssets?.[placeholderIndex] || null;
-            const hasKnownSize = assetMeta && assetMeta.width && assetMeta.height;
-            const imgStyle = hasKnownSize
-              ? `max-width: 100%; width: ${Math.min(assetMeta.width, 700)}px; height: auto; aspect-ratio: ${assetMeta.width} / ${assetMeta.height}; border-radius: 8px; display: block; margin: 0 auto; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);`
-              : `max-width: 100%; max-height: 400px; border-radius: 8px; display: block; margin: 0 auto; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);`;
-
-            detachedContainer.innerHTML = `<img src="${base64}" data-phase4-asset-index="${placeholderIndex}" style="${imgStyle}" alt="Uploaded Diagram" />`;
-            detachedContainer.style.border = 'none';
-            detachedContainer.style.background = 'transparent';
-            detachedContainer.style.padding = '0';
-
-            const pageId = pageIdForAsset;
-
-            const customEvent = new CustomEvent('diagramUploaded', {
-              detail: { pageId, newHtml: detachedRoot.innerHTML }
-            });
-            document.dispatchEvent(customEvent);
-          }
-        };
-        reader.readAsDataURL(file);
-      }
-    };
-
-    const handleDiagramStateUpdate = (e) => {
-      const { pageId, newHtml } = e.detail;
-      setParsedSections(prev => prev.map(s => (s.id === pageId ? { ...s, translatedHtml: newHtml } : s)));
-    };
-
-    document.addEventListener('change', handleFileSelect);
-    document.addEventListener('diagramUploaded', handleDiagramStateUpdate);
-
-    return () => {
-      document.removeEventListener('change', handleFileSelect);
-      document.removeEventListener('diagramUploaded', handleDiagramStateUpdate);
-    };
-  }, []);
+  // PHASE 1 FIX (issue 1.9): the old approach embedded a raw <input type="file">
+  // directly inside the contentEditable translation editor's HTML. Clicking a
+  // file input nested inside a contentEditable ancestor is unreliable across
+  // browsers - contentEditable regions commonly intercept the click for text
+  // caret placement instead of letting it reach the native file input, so the
+  // "upload option" looked like it didn't exist even though the markup was
+  // technically there. Initial upload now reuses the same reliable, already-
+  // working pattern as "Replace Image" below: a temporary file input created
+  // OUTSIDE the contentEditable tree (appended to document.body, clicked
+  // programmatically, then removed) - see the post-render effect further
+  // down, which wires an onClick on the placeholder itself to
+  // handleReplaceUploadedImage for both the "not yet uploaded" and "replace
+  // an existing upload" cases alike.
 
   // PHASE 4: keep a window-level mirror of parsedSections so the (module-scope)
   // file-select handler above can look up Phase 2 visual asset geometry for the
@@ -1300,7 +1248,16 @@ const App = () => {
   // into the Gemini response shape before returning. This means NONE of the
   // downstream logic (glossary parsing, diagnostics, validation, etc.) had to
   // change - only this one function's internals did.
-  const callMistral = async (parts) => {
+  // PHASE 2: callMistral now accepts an optional systemText as a second
+  // argument. When provided, it's sent as a genuine system-role message,
+  // with only the page-specific parts (page text, glossary/context hints,
+  // and the image) in the user-role message. Models generally follow
+  // system-level instructions more consistently than instructions buried
+  // inside one long user turn - moving the STABLE rules (anti-substitution,
+  // footnote handling, output format) to system and leaving only the
+  // PAGE-SPECIFIC content in user is the goal here. Callers that don't pass
+  // systemText keep working exactly as before (single user-role message).
+  const callMistral = async (parts, systemText = null) => {
     const activeKeys = apiKeys.map(k => k.trim()).filter(Boolean);
     if (activeKeys.length === 0) {
       throw new Error("NO_API_KEY");
@@ -1324,6 +1281,10 @@ const App = () => {
       return null;
     }).filter(Boolean);
 
+    const messages = systemText
+      ? [{ role: 'system', content: systemText }, { role: 'user', content }]
+      : [{ role: 'user', content }];
+
     let attempts = 0;
     const maxAttempts = activeKeys.length;
 
@@ -1344,7 +1305,23 @@ const App = () => {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${activeKey}`
           },
-          body: JSON.stringify({ model: MISTRAL_MODEL, messages: [{ role: 'user', content }] })
+          body: JSON.stringify({
+            model: MISTRAL_MODEL,
+            messages,
+            // PHASE 0: low temperature - this is a mechanical mirroring/
+            // translation task, not creative writing. A lower value reduces
+            // drift into paraphrasing, wrong-sentence substitution, and
+            // improvised footnote handling instead of following the strict
+            // format the prompt asks for.
+            temperature: 0.15,
+            // PHASE 0: generous max_tokens (well under the account's 256k
+            // combined input+output cap) so a dense page's full translated
+            // HTML + footnotes + trailing glossary JSON is never silently
+            // truncated mid-response - a cut-off response looks identical to
+            // "the model dropped the footnote/paragraph", but has nothing to
+            // do with model capability.
+            max_tokens: 16000
+          })
         }, 60000, acquireSlot);
 
         // Reshape Mistral's { choices: [{ message: { content } }] } reply
@@ -1420,8 +1397,25 @@ const App = () => {
     const repeatedMetadataHints = buildRepeatedMetadataPromptSection(structure, glossaryList);
 
     const targetName = TARGET_LABELS[targetLang];
-    const prompt = `
-      READ THIS SOURCE PAGE (ARABIC / URDU / ENGLISH) AND PRODUCE ITS 100% MIRRORED ${targetName.toUpperCase()} TRANSLATION AS STYLED HTML, IN ONE SINGLE PASS.
+
+    // PHASE 2: STABLE, page-independent rules go in the system message.
+    // PHASE 3 content improvements applied here:
+    //  - footnote handling moved up, directly after RULE #1 (earlier
+    //    instructions tend to get more reliable weighting than instructions
+    //    buried later in a long prompt), and its marker cross-check language
+    //    tightened further.
+    //  - text alignment: replaced fixed per-block-type defaults with an
+    //    instruction to observe and reproduce each block's actual alignment.
+    //  - font size: replaced fixed px values with a relative-size-tier
+    //    system keyed off the block's size relative to body text, so a
+    //    visually large heading and a merely-slightly-larger subheading
+    //    don't both get force-mapped to the same fixed 24px/20px values.
+    //  - visual scan: added explicit positive/negative examples to reduce
+    //    both missed real images (1.7) and dense decorative/calligraphic
+    //    text being mistaken for an image (1.8).
+    //  - paragraph mirroring: added an explicit output-count reminder.
+    const systemPrompt = `
+      READ A SOURCE PAGE (ARABIC / URDU / ENGLISH) AND PRODUCE ITS 100% MIRRORED ${targetName.toUpperCase()} TRANSLATION AS STYLED HTML, IN ONE SINGLE PASS.
 
       ROLE: You are an expert scholarly translator. Your single most important job, above everything else in this prompt, is: translate exactly the sentence that is actually printed, in exactly the place it is printed, into faithful ${targetName} - never a different (even if related) sentence from elsewhere on the page.
       ${langInstruction}
@@ -1429,10 +1423,81 @@ const App = () => {
       ============================================================
       RULE #1 - THE MOST IMPORTANT RULE - NO CONTENT SUBSTITUTION (READ THIS FIRST, APPLY IT ABOVE ALL ELSE)
       ============================================================
-      This document contains dense, technical, citation-heavy academic/religious content (hadith science terminology, multi-narrator citation chains, scholarly argumentation). On pages like this, there is a known failure mode where a translator (human or AI) under cognitive load accidentally substitutes a DIFFERENT nearby sentence - often a quotation, footnote, or an adjacent paragraph discussing a related concept - in place of the sentence that was actually supposed to be translated at that position. This is a much more serious error than a wrong word choice: it silently replaces the meaning of an entire paragraph.
+      The source document contains dense, technical, citation-heavy academic/religious content (hadith science terminology, multi-narrator citation chains, scholarly argumentation). On pages like this, there is a known failure mode where a translator (human or AI) under cognitive load accidentally substitutes a DIFFERENT nearby sentence - often a quotation, footnote, or an adjacent paragraph discussing a related concept - in place of the sentence that was actually supposed to be translated at that position. This is a much more serious error than a wrong word choice: it silently replaces the meaning of an entire paragraph.
       YOU MUST ACTIVELY GUARD AGAINST THIS. For every paragraph, before finalizing its ${targetName} translation, re-confirm: "Is this translation actually derived from THIS SPECIFIC paragraph's own words, or did I drift into translating a different quotation/footnote/paragraph that happens to be nearby and discusses a similar topic?" If you notice any drift, discard it and re-translate strictly from the actual source sentence at that position, even if the correct translation reads as less polished, less complete, or less like a "clean quotable passage" than the substituted version would have.
       When a paragraph contains an embedded quotation (e.g. «...» or "..."), translate the quotation as part of that paragraph, in that exact position - do not let a quotation's content bleed into a neighboring paragraph, and do not let a neighboring paragraph's content bleed into the quotation.
       This rule OVERRIDES any instinct to produce smoother-sounding or more "complete" ${targetName} text. A literal, faithful translation of the correct sentence is always better than a fluent translation of the wrong sentence.
+
+      ============================================================
+      RULE #1B - FOOTNOTE HANDLING (READ THIS SECOND - MOVED UP BECAUSE IT IS COMMONLY MISHANDLED)
+      ============================================================
+      Step 1: Read the ENTIRE body text of the page first, top to bottom, ignoring the footnote block completely for now.
+      Step 2: While reading the body, keep every footnote reference marker (superscript number/symbol) exactly in place in your translation - the marker is a structural element and must survive into the translation (as a REFERENCE NUMBER, see numeral handling below). Do NOT look ahead at the footnote block's content while translating the body - the footnote's MEANING must never be used to complete, clarify, or supplement the body sentence it's attached to (this is the single most common form of RULE #1 content-bleeding: a translator "borrows" a nearby footnote's wording because it's topically related).
+      Step 3: Only after the ENTIRE body is translated, separately read and translate the footnote block, footnote-by-footnote, each strictly from its own text.
+      Step 4: Cross-check by marker number: every marker that appears in the body must have exactly one matching footnote entry with the same number, and every footnote entry's number must appear exactly once in the body. List them out mentally (marker 1 -> footnote 1, marker 2 -> footnote 2, ...) and confirm none are missing, duplicated, or mismatched.
+      Step 5: Compare body vs. footnote translations sentence-by-sentence: if any exact sentence appears in both, that is an error - remove the duplicate from the body and restore the body's own faithful (possibly shorter/cut-off) translation instead.
+      Step 6: Footnotes belong in their own <div class="footnotes">...</div> block (see styling below), physically separate from the body <p> blocks - never interleave a footnote's translated text into the middle of a body paragraph.
+
+      ${buildMixedDirectionInstructions(targetLang)}
+      ============================================================
+      RULE #2 - NEVER OUTPUT THE ORIGINAL-LANGUAGE TEXT
+      ============================================================
+      The original Arabic/Urdu/English source text must NEVER appear anywhere in your output as a substitute for translation - only the ${targetName} translation is the deliverable, even for the densest citation-chain passages. (See the MIXED DIRECTION section above for the narrow, explicitly-marked exception of a short embedded original-script liturgical quotation kept alongside its ${targetName} rendering - that is not "leaving text untranslated", it is a deliberate scholarly convention already called for elsewhere in this prompt.)
+
+      --- IMAGE OCR & BLANK PAGE HANDLING ---
+      If the page's extracted text layer (given to you in the user message) is empty, garbage, or incomplete (e.g. a scanned image-only PDF), rely ENTIRELY on the provided page image to perform OCR and read the full source text accurately before translating.
+      If the image and text BOTH contain no readable content (a genuinely blank page), ignore all layout rules and output EXACTLY:
+      <p style="text-align: center; color: #94A3B8; font-style: italic; font-size: 16px; margin-top: 40px;">No Text Found</p>
+
+      --- LAYOUT FIDELITY (INCLUDING PARAGRAPH COUNT) ---
+      Preserve the EXACT paragraph breaks, lists, tables, and physical structure of the original page - do not re-order, combine, or split paragraphs, and do not summarize, omit, or add any text or meaning that isn't in the source. Only the LANGUAGE changes, to ${targetName}; the structure stays a 1:1 mirror. Concretely: the number of body <p> blocks you output should equal the number of distinct paragraphs visible in the source - if the source has 5 paragraphs, output 5 <p> blocks, not 3 merged ones and not 7 artificially split ones.
+
+      --- TRANSLATE EVERY VISIBLE TEXT ELEMENT - NO EXCEPTIONS ---
+      Every visible piece of text on the page must be translated, including running headers/footers, journal/publication names, issue numbers, dates, and page numbers (small metadata strips at the top/bottom included). Nothing is left in the original language anywhere on the page (outside the narrow embedded-quotation exception above).
+${buildNumeralHandlingInstructions(targetLang)}
+      --- NO INVENTED COMPLETIONS ---
+      If a sentence, heading, or list item appears cut off at the bottom of the page, translate it AS CUT OFF - do not invent a completion from your own knowledge (even of a well-known hadith/verse), and do not add trailing punctuation that wasn't in the source.
+
+      --- DEDICATED VISUAL SCAN STEP (DO THIS SEPARATELY FROM READING TEXT) ---
+      Visually scan the ENTIRE page image for any non-text visual element: photographs, diagrams, charts, graphs, maps, tables-as-images, illustrations, icons, stamps, seals, logos, letterheads, infographics, screenshots, decorative borders/dividers.
+      EXAMPLES OF THINGS THAT ARE REAL VISUAL ELEMENTS (mark these): a photograph or portrait; a hand-drawn or printed diagram/chart/map; a small circular or rectangular stamp/seal (often faint, monochrome, or near a title - do not mistake it for decorative heading styling); a publisher's logo/letterhead graphic; a scanned signature.
+      EXAMPLES OF THINGS THAT ARE NOT VISUAL ELEMENTS (do NOT mark these, just translate them as text): dense Arabic/Urdu calligraphic body text, even if visually ornate; a decorative horizontal rule/divider line with no image content; a bordered text box that only contains translatable words; a table of words/numbers (translate as an HTML table instead, if the table-handling rules elsewhere apply); large stylized heading text that is still just text, not a logo.
+      When genuinely uncertain whether something is a real graphic or just stylized text, look for it having no readable linguistic content of its own (a stamp/seal/logo typically has little to no independently readable sentence-level text) - if you can read it as a sentence, it's text, not an image.
+      For EACH real visual element found, output this EXACT HTML in its correct spatial place:
+      <div class="diagram-placeholder" style="border: 2px dashed #CBD5E1; padding: 20px; text-align: center; border-radius: 8px; margin: 16px 0; cursor: pointer;"><p style="font-size: 14px; color: #64748B; margin-bottom: 8px;">📤 Image Detected. Click here to upload replacement.</p></div>
+
+      --- BEAUTIFICATION & STYLING (INLINE CSS ONLY, OUTPUT IS ${targetName.toUpperCase()}) ---
+      Output text is always ${targetName}, and the page as a whole is always LTR (direction: ltr;) regardless of source direction - see MIXED DIRECTION above for the narrow local-span exception.
+
+      ALIGNMENT - observe, don't assume: for EVERY block, look at how it is actually aligned in the source image (left, center, right, or justified) and set text-align accordingly, rather than defaulting every heading to center and every body paragraph to justify regardless of the source. Only fall back to the defaults below (center for headings, justify for body) when the source's own alignment is genuinely ambiguous or the page has no reliable text-layer/image cue for it.
+
+      FONT SIZE - relative tier, not one fixed number: judge each block's size RELATIVE to that page's own body text size, then map it to the nearest tier below, rather than always using the same fixed px value regardless of how large the source heading actually looks:
+        - Tier "large heading" (source heading is clearly much bigger than body, e.g. a chapter/section title): font-size: 26px-28px
+        - Tier "medium heading" (clearly bigger than body but not the page's biggest element): font-size: 20px-22px
+        - Tier "subheading/emphasis line" (only slightly bigger or bolder than body): font-size: 18px-19px
+        - Tier "body" (the page's normal running text size): font-size: 16px-18px
+        - Tier "small/footnote" (visibly smaller than body, e.g. footnotes, captions, fine print): font-size: 13px-14px
+
+      1. Heading (large or medium tier per above): <p style="text-align: center; color: #4338CA; font-size: [26-28px large tier / 20-22px medium tier]; font-weight: bold; margin-bottom: 20px;">...</p> (use text-align per the ALIGNMENT guidance above, center is only the fallback default)
+      2. Subheading: <p style="color: #0F172A; font-size: [18-19px]; font-weight: bold; margin-bottom: 12px; border-bottom: 1px solid #E2E8F0; padding-bottom: 8px;">...</p>
+      3. Body text: <p style="text-align: [observed alignment, justify as fallback]; color: #334155; font-size: [16-18px]; line-height: 1.8; margin-bottom: 16px;">...</p>
+      4. Highlights: <span style="color: #BE123C; font-weight: bold;">...</span> for emphasis/Quranic verses/key terms.
+      5. Footnotes: <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;"><p style="color: #64748B; font-size: [13-14px];">...</p></div>
+      6. Preserve Quranic verses / Arabic religious terms with standard ${targetName} transliteration or brief explanation where appropriate.
+
+      DO NOT use markdown code blocks (\`\`\`html). Output raw styled HTML directly.
+
+      --- GLOSSARY SUGGESTIONS (APPEND AFTER THE HTML) ---
+      After the closing HTML, on a new line by itself, append a line in EXACTLY this format:
+      GLOSSARY_JSON:[{"source":"<original-language term>","translated":"<approved ${targetName} rendering>"}, ...]
+      List at most 8 important recurring proper nouns, names, or technical/religious terms from THIS page (if any) whose ${targetName} rendering should stay consistent if they reappear on later pages. If none are notable, output exactly: GLOSSARY_JSON:[]
+      This line must come AFTER all the HTML and must be the very last thing in your response.
+    `;
+
+    // PHASE 2: PAGE-SPECIFIC content only goes in the user message - the raw
+    // source text, this page's structural hints (block map/context/glossary/
+    // repeated-metadata), and the page image.
+    const userPrompt = `
       ${blockMapSection ? `
       --- SOURCE BLOCK MAP (BLOCK-TO-TRANSLATION CORRESPONDENCE) ---
       The source page has been pre-segmented into the following structural blocks (id, type, and a short text snippet for identification only - always translate from the FULL source text/image, this snippet is just to locate the block). Use each block's OWN text as the sole source for its own translation - never let one block's content substitute for another's, especially between a "footnote"/"citation"/"quote" block and a nearby "paragraph" block. Where practical, mark the top-level HTML element you produce for each block with a matching data-block-id="<id>" attribute (in addition to its required inline style), so correspondence can be verified:
@@ -1453,60 +1518,18 @@ ${glossaryExcerpt}
 ${repeatedMetadataHints}
 ` : ''}
 
-      ============================================================
-      RULE #2 - NEVER OUTPUT THE ORIGINAL-LANGUAGE TEXT
-      ============================================================
-      The original Arabic/Urdu/English source text must NEVER appear anywhere in your output as a substitute for translation - only the ${targetName} translation is the deliverable, even for the densest citation-chain passages. (See the MIXED DIRECTION section below for the narrow, explicitly-marked exception of a short embedded original-script liturgical quotation kept alongside its ${targetName} rendering - that is not "leaving text untranslated", it is a deliberate scholarly convention already called for elsewhere in this prompt.)
-
       RAW TEXT CONTENT (extracted from the page's text layer - may be empty/garbled if this is a scanned/image-only page):
       """
       ${pageText}
       """
 
-      --- IMAGE OCR & BLANK PAGE HANDLING ---
-      If "RAW TEXT CONTENT" is empty, garbage, or incomplete (e.g. a scanned image-only PDF), rely ENTIRELY on the provided page image to perform OCR and read the full source text accurately before translating.
-      If the image and text BOTH contain no readable content (a genuinely blank page), ignore all layout rules and output EXACTLY:
-      <p style="text-align: center; color: #94A3B8; font-style: italic; font-size: 16px; margin-top: 40px;">No Text Found</p>
-
-      --- LAYOUT FIDELITY ---
-      Preserve the EXACT paragraph breaks, lists, tables, and physical structure of the original page - do not re-order, combine, or split paragraphs, and do not summarize, omit, or add any text or meaning that isn't in the source. Only the LANGUAGE changes, to ${targetName}; the structure stays a 1:1 mirror.
-
-      --- TRANSLATE EVERY VISIBLE TEXT ELEMENT - NO EXCEPTIONS ---
-      Every visible piece of text on the page must be translated, including running headers/footers, journal/publication names, issue numbers, dates, and page numbers (small metadata strips at the top/bottom included). Nothing is left in the original language anywhere on the page (outside the narrow embedded-quotation exception below).
-${buildNumeralHandlingInstructions(targetLang)}
-      --- FOOTNOTE HANDLING ---
-      Read the body text first, keeping every footnote reference marker (superscript number/symbol) exactly in place - the marker is a structural element and must survive into the translation (as a REFERENCE NUMBER, see numeral handling above), but the footnote's MEANING must never be used to complete, clarify, or supplement the body (see RULE #1 above: proximity to a footnote is exactly the kind of situation where content substitution/bleeding happens - stay anchored to the body's own actual sentence). Read and translate the footnote block separately. Cross-check that every marker in the body has a matching footnote entry and vice versa. After drafting, compare body vs. footnote translations sentence-by-sentence: if any exact sentence appears in both, that's an error - remove the duplicate from the body and restore the body's own faithful (possibly cut-off) translation.
-
-      --- NO INVENTED COMPLETIONS ---
-      If a sentence, heading, or list item appears cut off at the bottom of the page, translate it AS CUT OFF - do not invent a completion from your own knowledge (even of a well-known hadith/verse), and do not add trailing punctuation that wasn't in the source.
-${buildMixedDirectionInstructions(targetLang)}
-      --- DEDICATED VISUAL SCAN STEP ---
-      Separately from reading the text, visually scan the ENTIRE page image for any non-text visual element: photographs, diagrams, charts, graphs, maps, tables-as-images, illustrations, icons, stamps, seals, logos, letterheads, infographics, screenshots, decorative borders/dividers. Logos/seals/stamps are the most commonly missed - they are often small, subtle, monochrome, or near a title, and can be mistaken for decorative heading design; check for them specifically rather than assuming a mark near a title is just styling.
-      For EACH element found, output this EXACT HTML in its correct spatial place:
-      <div class="diagram-placeholder" style="border: 2px dashed #CBD5E1; padding: 20px; text-align: center; border-radius: 8px; margin: 16px 0;"><p style="font-size: 14px; color: #64748B; margin-bottom: 8px;">Image Detected. Click to upload replacement.</p><input type="file" accept="image/*" class="diagram-upload-input" /></div>
-
-      --- BEAUTIFICATION & STYLING (INLINE CSS ONLY, OUTPUT IS ${targetName.toUpperCase()}) ---
-      Output text is always ${targetName}, and the page as a whole is always LTR (direction: ltr;) regardless of source direction - see MIXED DIRECTION above for the narrow local-span exception.
-      1. Heading 1: <p style="text-align: center; color: #4338CA; font-size: 24px; font-weight: bold; margin-bottom: 20px;">...</p>
-      2. Heading 2: <p style="color: #0F172A; font-size: 20px; font-weight: bold; margin-bottom: 12px; border-bottom: 1px solid #E2E8F0; padding-bottom: 8px;">...</p>
-      3. Body text: <p style="text-align: justify; color: #334155; font-size: 18px; line-height: 1.8; margin-bottom: 16px;">...</p>
-      4. Highlights: <span style="color: #BE123C; font-weight: bold;">...</span> for emphasis/Quranic verses/key terms.
-      5. Footnotes: <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;"><p style="color: #64748B; font-size: 14px;">...</p></div>
-      6. Preserve Quranic verses / Arabic religious terms with standard ${targetName} transliteration or brief explanation where appropriate.
-
-      DO NOT use markdown code blocks (\`\`\`html). Output raw styled HTML directly.
-
-      --- GLOSSARY SUGGESTIONS (APPEND AFTER THE HTML) ---
-      After the closing HTML, on a new line by itself, append a line in EXACTLY this format:
-      GLOSSARY_JSON:[{"source":"<original-language term>","translated":"<approved ${targetName} rendering>"}, ...]
-      List at most 8 important recurring proper nouns, names, or technical/religious terms from THIS page (if any) whose ${targetName} rendering should stay consistent if they reappear on later pages. If none are notable, output exactly: GLOSSARY_JSON:[]
-      This line must come AFTER all the HTML and must be the very last thing in your response.
+      Now translate this page following every rule given in the system message above.
     `;
 
     const data = await callMistral([
-      { text: prompt },
+      { text: userPrompt },
       ...(imagePayload ? [imagePayload] : [])
-    ]);
+    ], systemPrompt);
 
     let rawResponse = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").replace(/```html|```/gi, '').trim();
 
@@ -1542,9 +1565,32 @@ ${buildMixedDirectionInstructions(targetLang)}
     }
 
     const verifyTargetName = TARGET_LABELS[targetLang];
-    const prompt = `
+
+    // PHASE 2: audit checklist and output-format rules are stable regardless
+    // of which page is being checked - system message.
+    const verifySystemPrompt = `
       YOU ARE A PROOFREADER/AUDITOR, NOT A TRANSLATOR. Your job is to CHECK an existing ${verifyTargetName} translation against its original source page, and fix ONLY real errors you find - not to re-translate from scratch or rewrite style choices you simply would have phrased differently.
 
+      Check specifically for these failure modes, one by one:
+      1. CONTENT SUBSTITUTION: does each paragraph's ${verifyTargetName} actually correspond to THAT SAME paragraph's source text, or did content drift in from a nearby quotation, footnote, or adjacent paragraph discussing a related topic?
+      2. HALLUCINATION / INVENTED COMPLETIONS: did the translation add words, sentences, or punctuation not present in the source - especially completing a sentence that was actually cut off at the bottom of the page?
+      3. FOOTNOTE MARKERS: does every footnote reference marker (superscript number/symbol) in the body have a matching footnote entry, and vice versa? Did any footnote's meaning bleed into the body text (or an identical sentence appear in both)? Are footnotes kept in their own separate <div class="footnotes"> block rather than interleaved into body paragraphs?
+      4. ORIGINAL-LANGUAGE LEFTOVERS: does any Arabic/Urdu/English text remain anywhere in the output that should have been translated to ${verifyTargetName} (outside a deliberately marked, narrow embedded-quotation exception)?
+      5. VISUAL ELEMENT PLACEHOLDERS: compare the page image (if provided) against the HTML - is any photograph, diagram, chart, graph, map, table-as-image, illustration, icon, stamp, seal, or logo visible on the page missing its placeholder <div class="diagram-placeholder">...</div> block? Conversely, was any purely decorative/calligraphic text or divider line incorrectly turned into a placeholder when it should have just been translated as text?
+      6. HEADERS/FOOTERS/PAGE NUMBERS: is every peripheral text element (running header/footer, journal name, issue number, date, page number) fully translated to ${verifyTargetName}, using narrative-numeral conventions rather than reference-numeral ones?
+      7. NUMERAL HANDLING: were any REFERENCE numbers (footnote markers, citation numbers, page/volume/issue numbers used as identifiers) incorrectly converted or reformatted when they should have been preserved exactly as identifiers?
+      8. PARAGRAPH COUNT: does the number of body <p> blocks in the translation roughly match the number of distinct paragraphs in the source (not artificially merged or split)?
+      9. ALIGNMENT & SIZE FIDELITY: does each block's text-align and relative font-size roughly reflect what's actually observed in the source image, rather than every heading being force-centered and every body paragraph force-justified regardless of the source?
+
+      OUTPUT RULES:
+      - If you find NO issues after checking all nine points above, respond with EXACTLY this sentinel text and nothing else: NO_CORRECTIONS_NEEDED
+      - If you find ANY issue, respond with the FULL corrected HTML (same format/styling conventions as the input - styled <p>/<div>/<span> tags, ${verifyTargetName} text, page-level LTR direction with only narrow local dir="rtl" spans where explicitly appropriate), with ONLY the specific errors fixed. Do not rewrite or rephrase parts that were already correct - preserve everything that wasn't actually wrong.
+      - Do not use markdown code blocks. Output either the sentinel text alone, or raw HTML alone - never both, never any other commentary.
+    `;
+
+    // PHASE 2: page-specific content only - the actual source text and draft
+    // translation being audited.
+    const verifyUserPrompt = `
       ORIGINAL SOURCE PAGE TEXT (Arabic / Urdu / English - also see attached page image if provided):
       """
       ${pageText}
@@ -1555,26 +1601,14 @@ ${buildMixedDirectionInstructions(targetLang)}
       ${translatedHtmlDraft}
       """
 
-      Check specifically for these failure modes, one by one:
-      1. CONTENT SUBSTITUTION: does each paragraph's ${verifyTargetName} actually correspond to THAT SAME paragraph's source text, or did content drift in from a nearby quotation, footnote, or adjacent paragraph discussing a related topic?
-      2. HALLUCINATION / INVENTED COMPLETIONS: did the translation add words, sentences, or punctuation not present in the source - especially completing a sentence that was actually cut off at the bottom of the page?
-      3. FOOTNOTE MARKERS: does every footnote reference marker (superscript number/symbol) in the body have a matching footnote entry, and vice versa? Did any footnote's meaning bleed into the body text (or an identical sentence appear in both)?
-      4. ORIGINAL-LANGUAGE LEFTOVERS: does any Arabic/Urdu/English text remain anywhere in the output that should have been translated to ${verifyTargetName} (outside a deliberately marked, narrow embedded-quotation exception)?
-      5. VISUAL ELEMENT PLACEHOLDERS: compare the page image (if provided) against the HTML - is any photograph, diagram, chart, graph, map, table-as-image, illustration, icon, stamp, seal, or logo visible on the page missing its placeholder <div class="diagram-placeholder">...</div> block?
-      6. HEADERS/FOOTERS/PAGE NUMBERS: is every peripheral text element (running header/footer, journal name, issue number, date, page number) fully translated to ${verifyTargetName}, using narrative-numeral conventions rather than reference-numeral ones?
-      7. NUMERAL HANDLING: were any REFERENCE numbers (footnote markers, citation numbers, page/volume/issue numbers used as identifiers) incorrectly converted or reformatted when they should have been preserved exactly as identifiers?
-
-      OUTPUT RULES:
-      - If you find NO issues after checking all seven points above, respond with EXACTLY this sentinel text and nothing else: NO_CORRECTIONS_NEEDED
-      - If you find ANY issue, respond with the FULL corrected HTML (same format/styling conventions as the input - styled <p>/<div>/<span> tags, ${verifyTargetName} text, page-level LTR direction with only narrow local dir="rtl" spans where explicitly appropriate), with ONLY the specific errors fixed. Do not rewrite or rephrase parts that were already correct - preserve everything that wasn't actually wrong.
-      - Do not use markdown code blocks. Output either the sentinel text alone, or raw HTML alone - never both, never any other commentary.
+      Audit this translation against the source following every checklist item and output rule given in the system message above.
     `;
 
     try {
       const data = await callMistral([
-        { text: prompt },
+        { text: verifyUserPrompt },
         ...(imagePayload ? [imagePayload] : [])
-      ]);
+      ], verifySystemPrompt);
 
       let rawText = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").replace(/```html|```/gi, '').trim();
 
@@ -1802,7 +1836,7 @@ ${buildMixedDirectionInstructions(targetLang)}
       target.style.border = '2px dashed #CBD5E1';
       target.style.background = '';
       target.style.padding = '20px';
-      target.innerHTML = '<p style="font-size: 14px; color: #64748B; margin-bottom: 8px;">Image Detected. Click to upload replacement.</p><input type="file" accept="image/*" class="diagram-upload-input" />';
+      target.innerHTML = '<p style="font-size: 14px; color: #64748B; margin-bottom: 8px;">📤 Image Detected. Click here to upload replacement.</p>';
       return { ...s, translatedHtml: wrapper.innerHTML };
     }));
     setSuccessMsg('Image removed. You can upload a new one for this placeholder.');
@@ -1873,7 +1907,17 @@ ${buildMixedDirectionInstructions(targetLang)}
         : null;
 
       if (!hasImage) {
-        // Not yet uploaded - no controls needed, native upload input handles it.
+        // PHASE 1 FIX (issue 1.9): clicking the placeholder now opens a file
+        // picker via handleReplaceUploadedImage's outside-contentEditable
+        // temp-input pattern (the same reliable mechanism the "Replace
+        // Image" button already used successfully) - not an embedded
+        // <input type="file"> that contentEditable was swallowing clicks on.
+        placeholder.style.cursor = 'pointer';
+        placeholder.onclick = (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          handleReplaceUploadedImage(activeSectionId, idx);
+        };
         if (controls) controls.remove();
         return;
       }
