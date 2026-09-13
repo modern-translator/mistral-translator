@@ -1,0 +1,2920 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import {
+  Upload,
+  Loader2,
+  CheckCircle2,
+  X,
+  FileText,
+  AlertCircle,
+  ChevronRight,
+  BookOpen,
+  Settings,
+  Globe,
+  FileDown,
+  Sparkles,
+  HelpCircle,
+  Languages,
+  AlignLeft,
+  AlignRight,
+  Copy,
+  Check,
+  Eye,
+  SlidersHorizontal,
+  ShieldCheck,
+  RotateCcw,
+  Columns,
+  Layers,
+  ImageOff,
+  ImagePlus,
+  Info,
+  AlertTriangle
+} from 'lucide-react';
+
+// Exponential backoff fetch implementation with timeout and abort handling.
+const fetchWithRetry = async (url, options, timeoutMs = 60000, acquireSlot = null) => {
+  const delays = [1000, 2000, 4000, 8000, 16000];
+  let lastError;
+
+  for (let i = 0; i <= delays.length; i++) {
+    if (acquireSlot) {
+      await acquireSlot();
+    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        const statusError = new Error(`API Error ${response.status}: ${errorText || response.statusText}`);
+        statusError.status = response.status;
+        const retryAfterHeader = response.headers ? response.headers.get('Retry-After') : null;
+        if (retryAfterHeader) {
+          const asSeconds = Number(retryAfterHeader);
+          statusError.retryAfterMs = Number.isFinite(asSeconds)
+            ? asSeconds * 1000
+            : Math.max(0, new Date(retryAfterHeader).getTime() - Date.now());
+        }
+        throw statusError;
+      }
+      return await response.json();
+    } catch (error) {
+      clearTimeout(timeoutId);
+      lastError = error;
+
+      if (error.status === 429 || error.status === 400 || error.status === 403) {
+        throw error;
+      }
+
+      if (error.name === 'AbortError') {
+        console.warn(`Request timed out after ${timeoutMs}ms, retrying... (Attempt ${i + 1})`);
+      } else {
+        console.warn(`Fetch failed: ${error.message}. Retrying... (Attempt ${i + 1})`);
+      }
+
+      if (i < delays.length) {
+        await new Promise(resolve => setTimeout(resolve, delays[i]));
+      }
+    }
+  }
+  throw lastError;
+};
+
+// SINGLE MODEL ENGINE - Ministral 3 14B only, called through a small CORS
+// proxy (browsers cannot call api.mistral.ai directly). No model cascade:
+// this is a single paid-per-token model, not a free-tier daily-cap chain.
+const MISTRAL_MODEL = 'ministral-14b-2512';
+const MISTRAL_API_URL = 'https://mistral-proxy-wk5t.onrender.com/api/translate';
+
+// Exactly 5 key slots, rotated in strict round-robin order: 1 -> 2 -> 3 -> 4
+// -> 5 -> back to 1 -> ... A key rotates away the moment it returns a
+// quota/limit error (its cap hit) or an auth error (invalid key).
+const TOTAL_API_KEY_SLOTS = 5;
+// Mistral API keys are 25-40 characters long.
+const MIN_MISTRAL_KEY_LENGTH = 25;
+const MAX_MISTRAL_KEY_LENGTH = 40;
+
+const MAX_RETRY_AFTER_MS = 30000;
+// Minimum 2 second gap between EVERY outgoing request (first attempt or retry).
+const REQUEST_INTERVAL_MS = 2000;
+const LAST_REQUEST_TIME_STORAGE_KEY = 'translator_last_request_time_v1';
+
+// PHASE 1: lightweight, non-destructive validation of a translation result.
+const validateTranslationResult = (html, sourceText) => {
+  if (!html || !html.trim()) {
+    return { valid: false, reason: 'Empty translation result.' };
+  }
+  const stripped = html.replace(/<[^>]*>/g, '').trim();
+  const isBlankPageMessage = /No Text Found/i.test(stripped);
+  if (!isBlankPageMessage) {
+    if (stripped.length < 3) {
+      return { valid: false, reason: 'Translation result has no readable content.' };
+    }
+    const sourceLen = (sourceText || '').trim().length;
+    if (sourceLen > 200 && stripped.length < 15) {
+      return { valid: false, reason: 'Translation result is suspiciously short relative to the source page.' };
+    }
+  }
+
+  const blockIdMatches = [...html.matchAll(/data-block-id="([^"]*)"/g)].map(m => m[1]);
+  if (blockIdMatches.length > 0) {
+    const seen = new Set();
+    for (const id of blockIdMatches) {
+      if (!id) {
+        return { valid: false, reason: 'Missing block ID found in structured output.' };
+      }
+      if (seen.has(id)) {
+        return { valid: false, reason: `Duplicate block ID "${id}" found in structured output.` };
+      }
+      seen.add(id);
+    }
+  }
+
+  return { valid: true, reason: null };
+};
+
+// PHASE 4: lightweight, display-only diagnostics derived from existing Phase 1/2/3 data.
+// This NEVER mutates translation content and NEVER blocks anything - purely informational.
+const computeDiagnostics = (page) => {
+  if (!page) return null;
+  const structure = page.structure || null;
+  const sourceBlockCount = structure && Array.isArray(structure.blocks) ? structure.blocks.length : 0;
+  const html = page.translatedHtml || '';
+  const translatedBlockMatches = [...html.matchAll(/data-block-id="([^"]*)"/g)];
+  const translatedBlockCount = translatedBlockMatches.length;
+  const visualAssetCount = structure && Array.isArray(structure.visualAssets) ? structure.visualAssets.length : 0;
+  const placeholderCount = (html.match(/diagram-placeholder/g) || []).length;
+  const footnoteWarnings = structure && structure.footnotes && Array.isArray(structure.footnotes.warnings)
+    ? structure.footnotes.warnings
+    : [];
+
+  const warnings = [];
+
+  if (page.translationStatus === 'done') {
+    const validation = validateTranslationResult(html, page.content?.rawText);
+    if (!validation.valid) {
+      warnings.push({ type: 'short_or_empty', message: validation.reason });
+    }
+  }
+
+  if (sourceBlockCount > 0 && translatedBlockCount > 0 && translatedBlockCount !== sourceBlockCount) {
+    warnings.push({
+      type: 'block_mismatch',
+      message: `Source detected ${sourceBlockCount} block(s) but translated output tagged ${translatedBlockCount}.`
+    });
+  }
+
+  footnoteWarnings.forEach(fw => {
+    if (fw.type === 'duplicate_marker') {
+      warnings.push({ type: 'footnote_duplicate', message: `Duplicate footnote marker "${fw.marker}" detected (x${fw.count}).` });
+    } else if (fw.type === 'missing_marker') {
+      warnings.push({ type: 'footnote_missing', message: 'A footnote block has no detectable marker.' });
+    }
+  });
+
+  if (visualAssetCount > placeholderCount && page.translationStatus === 'done') {
+    warnings.push({
+      type: 'visual_uncertain',
+      message: `Detected ${visualAssetCount} visual element(s) on the source page but only ${placeholderCount} placeholder(s) in the translation.`
+    });
+  }
+
+  // Heuristic-only, non-blocking check for likely un-translated leftover script
+  // (outside any explicitly marked dir="rtl" embedded span, which is allowed).
+  if (page.translationStatus === 'done' && html) {
+    const withoutRtlSpans = html.replace(/<[^>]*dir=["']rtl["'][^>]*>[\s\S]*?<\/[a-zA-Z0-9]+>/g, '');
+    const hasArabicScript = /[\u0600-\u06FF]/.test(withoutRtlSpans.replace(/<[^>]*>/g, ''));
+    if (hasArabicScript) {
+      warnings.push({ type: 'possible_leftover_script', message: 'Possible untranslated Arabic/Urdu script detected outside a marked embedded span.' });
+    }
+  }
+
+  return {
+    sourceBlockCount,
+    translatedBlockCount,
+    visualAssetCount,
+    placeholderCount,
+    verificationStatus: page.translationStatus === 'done' ? (page.originalTranslatedHtml && page.originalTranslatedHtml !== page.translatedHtml ? 'edited-since-verify' : 'not-verified-yet') : page.translationStatus,
+    warnings
+  };
+};
+
+// ==================================================================
+// PHASE 2: PDF EXTRACTION & STRUCTURE METADATA (unchanged from baseline)
+// ==================================================================
+const groupItemsIntoLines = (positionedItems, lineTolerance = 3) => {
+  if (!positionedItems || positionedItems.length === 0) return [];
+
+  const sorted = [...positionedItems].sort((a, b) => {
+    if (Math.abs(a.y - b.y) > lineTolerance) return b.y - a.y;
+    return a.x - b.x;
+  });
+
+  const rawLines = [];
+  let current = null;
+  for (const item of sorted) {
+    if (!current || Math.abs(item.y - current.y) > lineTolerance) {
+      current = { y: item.y, items: [item] };
+      rawLines.push(current);
+    } else {
+      current.items.push(item);
+      current.y = (current.y * (current.items.length - 1) + item.y) / current.items.length;
+    }
+  }
+
+  return rawLines.map((line, idx) => {
+    const orderedItems = [...line.items].sort((a, b) => a.x - b.x);
+    const xs = orderedItems.map(i => i.x);
+    const rights = orderedItems.map(i => i.x + (i.width || 0));
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...rights);
+    const maxHeight = Math.max(...orderedItems.map(i => i.height || 0), 0);
+    const avgFontSize = orderedItems.reduce((sum, i) => sum + (i.fontSize || 0), 0) / (orderedItems.length || 1);
+    return {
+      lineIndex: idx,
+      y: line.y,
+      x: minX,
+      width: Math.max(0, maxX - minX),
+      height: maxHeight,
+      fontSize: avgFontSize || null,
+      fontName: orderedItems[0] ? orderedItems[0].fontName : null,
+      text: orderedItems.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim(),
+      items: orderedItems
+    };
+  }).filter(l => l.text.length > 0);
+};
+
+const detectColumns = (lines, pageWidth) => {
+  const fallback = { columnCount: 1, columns: [{ xStart: 0, xEnd: pageWidth || 0 }], confidence: 'default' };
+  if (!lines || lines.length === 0 || !pageWidth) return fallback;
+
+  const narrowLines = lines.filter(l => l.width > 0 && l.width < pageWidth * 0.55);
+  if (narrowLines.length < 8) return fallback;
+
+  const binSize = pageWidth / 20;
+  const bins = {};
+  narrowLines.forEach(l => {
+    const bin = Math.round(l.x / binSize);
+    bins[bin] = (bins[bin] || 0) + 1;
+  });
+
+  const sortedBins = Object.keys(bins).map(Number).sort((a, b) => a - b);
+  const clusters = [];
+  let currentCluster = [sortedBins[0]];
+  for (let i = 1; i < sortedBins.length; i++) {
+    if (sortedBins[i] - currentCluster[currentCluster.length - 1] <= 2) {
+      currentCluster.push(sortedBins[i]);
+    } else {
+      clusters.push(currentCluster);
+      currentCluster = [sortedBins[i]];
+    }
+  }
+  clusters.push(currentCluster);
+
+  const clusterInfo = clusters
+    .map(c => ({
+      xStart: Math.min(...c) * binSize,
+      count: c.reduce((sum, b) => sum + bins[b], 0)
+    }))
+    .filter(c => c.count >= 3)
+    .sort((a, b) => a.xStart - b.xStart);
+
+  if (clusterInfo.length < 2 || clusterInfo.length > 4) return fallback;
+
+  for (let i = 1; i < clusterInfo.length; i++) {
+    if (clusterInfo[i].xStart - clusterInfo[i - 1].xStart < pageWidth * 0.15) {
+      return fallback;
+    }
+  }
+
+  const columns = clusterInfo.map((c, i) => ({
+    xStart: c.xStart,
+    xEnd: i < clusterInfo.length - 1 ? clusterInfo[i + 1].xStart : pageWidth
+  }));
+
+  return { columnCount: columns.length, columns, confidence: 'detected' };
+};
+
+const buildColumnReadingOrder = (lines, columnInfo, isRtlPage) => {
+  if (!columnInfo || columnInfo.columnCount <= 1) {
+    return [...lines].sort((a, b) => b.y - a.y);
+  }
+  const columns = isRtlPage ? [...columnInfo.columns].reverse() : [...columnInfo.columns];
+  const assigned = columns.map(() => []);
+  const unassigned = [];
+
+  lines.forEach(line => {
+    const center = line.x + line.width / 2;
+    const colIdx = columns.findIndex(c => center >= c.xStart && center < c.xEnd);
+    if (colIdx === -1) {
+      unassigned.push(line);
+    } else {
+      assigned[colIdx].push(line);
+    }
+  });
+
+  assigned.forEach(col => col.sort((a, b) => b.y - a.y));
+  unassigned.sort((a, b) => b.y - a.y);
+
+  const ordered = [];
+  ordered.push(...unassigned.filter(l => l.width >= (columnInfo.columns[0]?.xEnd || 0) * 0.85));
+  const remainderUnassigned = unassigned.filter(l => !ordered.includes(l));
+  return [...ordered, ...assigned.flat(), ...remainderUnassigned];
+};
+
+const classifyBlocks = (lines, pageId, pageHeight, avgFontSize) => {
+  const blocks = [];
+  let blockCounter = 0;
+  const makeId = () => `page-${pageId}-block-${String(++blockCounter).padStart(2, '0')}`;
+
+  lines.forEach((line, idx) => {
+    const text = line.text;
+    if (!text) return;
+
+    const fontSize = line.fontSize || null;
+    const relY = pageHeight ? (pageHeight - line.y) / pageHeight : null;
+    const isNearTop = relY !== null && relY < 0.07;
+    const isNearBottom = relY !== null && relY > 0.88;
+    const isLarger = fontSize && avgFontSize && fontSize > avgFontSize * 1.15;
+    const isSmaller = fontSize && avgFontSize && fontSize < avgFontSize * 0.82;
+
+    const looksLikePageNumber = /^[\s\d٠-٩۰-۹]{1,6}$/.test(text) && text.replace(/\s/g, '').length <= 4;
+    const looksLikeFootnoteMarker = /^[\d١-٩۱-۹]{1,3}[.\)]\s/.test(text) || /^[*†‡]\s/.test(text);
+    const looksLikeListItem = /^[\-•●○◦‣]\s/.test(text) || /^\(?[\dأ-يa-zA-Z]{1,3}[.\)]\s/.test(text);
+    const looksLikeQuote = /^[«"“]/.test(text) || /[»"”]$/.test(text);
+    const looksLikeReligiousQuote = looksLikeQuote && /[﴾﴿]/.test(text);
+    const looksLikeCitation = /\([^()]{2,40},\s?\d{4}\)/.test(text) || /\[\d{1,3}\]\s*$/.test(text);
+
+    let type = 'paragraph';
+    if (looksLikePageNumber && (isNearTop || isNearBottom)) {
+      type = 'page_number';
+    } else if (isNearTop && idx === 0) {
+      type = 'header';
+    } else if (isNearBottom && idx === lines.length - 1) {
+      type = 'footer';
+    } else if (isSmaller && isNearBottom) {
+      type = 'footnote';
+    } else if (looksLikeReligiousQuote) {
+      type = 'religious_quote';
+    } else if (looksLikeQuote) {
+      type = 'quote';
+    } else if (looksLikeCitation) {
+      type = 'citation';
+    } else if (isLarger) {
+      type = 'heading';
+    } else if (looksLikeListItem) {
+      type = 'list_item';
+    }
+
+    blocks.push({
+      id: makeId(),
+      type,
+      text,
+      x: line.x,
+      y: line.y,
+      width: line.width,
+      height: line.height,
+      fontSize,
+      hasFootnoteMarker: looksLikeFootnoteMarker
+    });
+  });
+
+  return blocks;
+};
+
+const detectTableCandidates = (lines, pageWidth) => {
+  if (!lines || lines.length < 3 || !pageWidth) return [];
+  const candidates = [];
+  let runStart = null;
+
+  const isRowLike = (line) => line.items.length >= 3 && line.width < pageWidth * 0.9;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (isRowLike(lines[i])) {
+      if (runStart === null) runStart = i;
+    } else if (runStart !== null) {
+      if (i - runStart >= 3) candidates.push(lines.slice(runStart, i));
+      runStart = null;
+    }
+  }
+  if (runStart !== null && lines.length - runStart >= 3) {
+    candidates.push(lines.slice(runStart, lines.length));
+  }
+
+  return candidates.map((rows, tIdx) => {
+    const colCount = Math.min(...rows.map(r => r.items.length));
+    return {
+      tableIndex: tIdx,
+      rowCount: rows.length,
+      columnCount: colCount,
+      confidence: rows.length >= 4 && colCount >= 3 ? 'medium' : 'low',
+      cells: rows.map(r => r.items.slice(0, colCount).map(i => i.str))
+    };
+  }).filter(t => t.confidence !== 'low' || t.rowCount >= 3);
+};
+
+const buildFootnoteMetadata = (blocks) => {
+  const footnoteBlocks = blocks.filter(b => b.type === 'footnote');
+  const links = [];
+  const markerCounts = {};
+
+  footnoteBlocks.forEach(fb => {
+    const m = fb.text.match(/^([\d١-٩۱-۹]{1,3}|[*†‡])[.\)]?\s/);
+    const marker = m ? m[1] : null;
+    if (marker) {
+      markerCounts[marker] = (markerCounts[marker] || 0) + 1;
+      links.push({ footnoteBlockId: fb.id, marker });
+    } else {
+      links.push({ footnoteBlockId: fb.id, marker: null });
+    }
+  });
+
+  const warnings = [];
+  Object.entries(markerCounts).forEach(([marker, count]) => {
+    if (count > 1) {
+      warnings.push({ type: 'duplicate_marker', marker, count });
+    }
+  });
+  links.filter(l => !l.marker).forEach(l => {
+    warnings.push({ type: 'missing_marker', footnoteBlockId: l.footnoteBlockId });
+  });
+
+  return { links, warnings };
+};
+
+const detectLikelyContinuation = (blocks) => {
+  const contentBlocks = blocks.filter(b => !['header', 'footer', 'page_number'].includes(b.type));
+  if (contentBlocks.length === 0) return { endsWithContinuation: false, lastBlockId: null };
+  const last = contentBlocks[contentBlocks.length - 1];
+  const trimmed = (last.text || '').trim();
+  const endsWithTerminalPunctuation = /[.!?؟۔।:؛]\s*$/.test(trimmed);
+  return {
+    endsWithContinuation: trimmed.length > 0 && !endsWithTerminalPunctuation,
+    lastBlockId: last.id
+  };
+};
+
+const extractVisualAssetMetadata = async (page, pageId) => {
+  try {
+    if (!page.getOperatorList || !window.pdfjsLib || !window.pdfjsLib.OPS) return [];
+    const opList = await page.getOperatorList();
+    const OPS = window.pdfjsLib.OPS;
+    const imageOps = new Set([OPS.paintImageXObject, OPS.paintJpegXObject, OPS.paintImageMaskXObject].filter(Boolean));
+    const assets = [];
+    let counter = 0;
+    for (let i = 0; i < opList.fnArray.length; i++) {
+      if (imageOps.has(opList.fnArray[i])) {
+        counter += 1;
+        assets.push({
+          assetId: `page-${pageId}-visual-${counter}`,
+          type: 'image',
+          pageId,
+          approxX: null,
+          approxY: null,
+          width: null,
+          height: null,
+          description: null
+        });
+      }
+    }
+    return assets;
+  } catch (e) {
+    console.warn('PHASE 2: visual asset metadata scan skipped for page', pageId, e);
+    return [];
+  }
+};
+
+const computeRepeatedHeaderFooterMetadata = (allPageStructures) => {
+  const normalize = (t) => (t || '').trim().toLowerCase().replace(/\s+/g, ' ').replace(/[\d٠-٩۰-۹]+/g, '#');
+  const counts = {};
+
+  allPageStructures.forEach(ps => {
+    (ps.blocks || []).forEach(b => {
+      if (b.type === 'header' || b.type === 'footer') {
+        const key = normalize(b.text);
+        if (key.length < 3) return;
+        counts[key] = (counts[key] || 0) + 1;
+      }
+    });
+  });
+
+  return allPageStructures.map(ps => {
+    const repeated = (ps.blocks || [])
+      .filter(b => b.type === 'header' || b.type === 'footer')
+      .map(b => {
+        const key = normalize(b.text);
+        return { blockId: b.id, occurrences: counts[key] || 1 };
+      })
+      .filter(r => r.occurrences > 1);
+    return { ...ps, repeatedHeaderFooter: repeated };
+  });
+};
+
+// ==================================================================
+// PHASE 3: TRANSLATION PROMPT & CONSISTENCY HELPERS
+// ==================================================================
+
+// PHASE 3: normalize a term for glossary keying (case/space-insensitive match)
+const normalizeGlossaryKey = (s) => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+// PHASE 3: parses an optional trailing "GLOSSARY_JSON:[...]" line that the
+// model is asked to append after the HTML. Never throws - any parse failure
+// is treated as "no suggestions this time" so translation output is never
+// blocked or corrupted by a glossary-formatting slip.
+const parseGlossarySuggestionsFromResponse = (rawText) => {
+  if (!rawText) return { cleanedHtml: rawText, suggestions: [] };
+  const marker = /GLOSSARY_JSON\s*:\s*(\[[\s\S]*?\])\s*$/i;
+  const match = rawText.match(marker);
+  if (!match) return { cleanedHtml: rawText, suggestions: [] };
+
+  const cleanedHtml = rawText.slice(0, match.index).trim();
+  let suggestions = [];
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (Array.isArray(parsed)) {
+      suggestions = parsed
+        .filter(e => e && typeof e.source === 'string' && typeof e.translated === 'string' && e.source.trim() && e.translated.trim())
+        .slice(0, 8)
+        .map(e => ({ source: e.source.trim(), translated: e.translated.trim() }));
+    }
+  } catch (e) {
+    console.warn('PHASE 3: glossary suggestion block could not be parsed, skipping.', e);
+  }
+  return { cleanedHtml, suggestions };
+};
+
+// PHASE 3: merges newly-suggested glossary entries into the running
+// document-level glossary. Existing entries (especially anything a future
+// UI might mark userConfirmed) are never silently overwritten in meaning -
+// only occurrence counts increase and the first-seen Bangla rendering is
+// kept, which is what gives later pages a stable, consistent term to reuse.
+const mergeGlossaryEntries = (currentList, suggestions) => {
+  if (!suggestions || suggestions.length === 0) return currentList;
+  const next = [...currentList];
+  suggestions.forEach(({ source, translated }) => {
+    const key = normalizeGlossaryKey(source);
+    if (!key) return;
+    const existingIdx = next.findIndex(e => normalizeGlossaryKey(e.source) === key);
+    if (existingIdx === -1) {
+      next.push({ source, translated, occurrences: 1, userConfirmed: false });
+    } else {
+      next[existingIdx] = {
+        ...next[existingIdx],
+        occurrences: (next[existingIdx].occurrences || 1) + 1
+        // The translated rendering is intentionally left as-is once first recorded,
+        // unless a future UI marks it userConfirmed with an explicit edit.
+      };
+    }
+  });
+  return next;
+};
+
+// PHASE 3: small, targeted glossary excerpt for the prompt - top entries by
+// occurrence, capped so token usage stays bounded regardless of document size.
+const buildGlossaryPromptExcerpt = (glossaryList, limit = 25) => {
+  if (!glossaryList || glossaryList.length === 0) return null;
+  const top = [...glossaryList]
+    .sort((a, b) => (b.occurrences || 0) - (a.occurrences || 0))
+    .slice(0, limit);
+  if (top.length === 0) return null;
+  return top.map(e => `- "${e.source}" => "${e.translated}"`).join('\n');
+};
+
+// PHASE 3: block-to-translation correspondence prompt section. Only used
+// when Phase 2 produced structured blocks for this page; falls back to
+// nothing (whole-page prompt behavior) otherwise.
+const buildBlockMapPromptSection = (structure) => {
+  if (!structure || !Array.isArray(structure.blocks) || structure.blocks.length === 0) return null;
+  const rows = structure.blocks.map(b => {
+    const snippet = (b.text || '').slice(0, 90).replace(/\s+/g, ' ');
+    return `- id="${b.id}" type="${b.type}": "${snippet}${b.text.length > 90 ? '…' : ''}"`;
+  }).join('\n');
+  return rows;
+};
+
+// PHASE 3: small, targeted document-level context (neighboring-page
+// continuation + a pseudo section heading). Deliberately excludes full page
+// text from unrelated parts of the document.
+const buildContextPromptSection = (structure, prevPageStructure) => {
+  const lines = [];
+  const currentHeadingBlock = structure?.blocks?.find(b => b.type === 'heading');
+  if (currentHeadingBlock) {
+    lines.push(`This page's likely section/heading: "${currentHeadingBlock.text.slice(0, 100)}"`);
+  }
+  if (prevPageStructure?.continuation?.endsWithContinuation) {
+    lines.push('The previous page ended mid-sentence (no terminal punctuation). If this page\'s first paragraph is a continuation of that sentence, translate it as the continuation it is - do not insert an artificial new-sentence break, and do not fabricate or repeat the missing words from the previous page.');
+  }
+  const prevHeadingBlock = prevPageStructure?.blocks?.find(b => b.type === 'heading');
+  if (prevHeadingBlock && !currentHeadingBlock) {
+    lines.push(`The previous page's section/heading was: "${prevHeadingBlock.text.slice(0, 100)}" - this page may still be under that same section.`);
+  }
+  if (lines.length === 0) return null;
+  return lines.join('\n');
+};
+
+// PHASE 3: repeated header/footer consistency hint - looks up any existing
+// glossary translation for text Phase 2 flagged as repeating elsewhere in
+// the document, so the same running header/footer isn't re-worded every time.
+const buildRepeatedMetadataPromptSection = (structure, glossaryList) => {
+  if (!structure || !Array.isArray(structure.repeatedHeaderFooter) || structure.repeatedHeaderFooter.length === 0) return null;
+  if (!glossaryList || glossaryList.length === 0) return null;
+  const hints = [];
+  structure.repeatedHeaderFooter.forEach(r => {
+    const block = structure.blocks.find(b => b.id === r.blockId);
+    if (!block) return;
+    const key = normalizeGlossaryKey(block.text);
+    const match = glossaryList.find(e => normalizeGlossaryKey(e.source) === key);
+    if (match) {
+      hints.push(`- "${block.text.slice(0, 90)}" => use exactly: "${match.translated}"`);
+    }
+  });
+  if (hints.length === 0) return null;
+  return hints.join('\n');
+};
+
+// Display name for each supported target language.
+const TARGET_LABELS = { bn: 'Bangla', en: 'English' };
+
+// PHASE 3: static numeral-handling instructions, made deliberate rather than
+// a blanket "convert every number" rule. Parameterized by target language:
+// Bangla has its own numeral glyphs to convert to; English uses standard
+// Western numerals, so the guidance differs slightly (see the two branches).
+const buildNumeralHandlingInstructions = (targetCode) => {
+  if (targetCode === 'en') {
+    return `
+      --- NUMERAL HANDLING (BE DELIBERATE, NOT BLANKET) ---
+      English uses standard Western numerals (0-9) for all numbers, so no separate numeral-script conversion is needed the way it would be for a language with its own numeral glyphs. Still distinguish two categories of numbers before rendering them, since the source may use Arabic-Indic digits (٠١٢٣...) or Eastern numeral forms that must be normalized to standard Western digits either way:
+      1. NARRATIVE NUMBERS - numbers that are part of the flowing sentence content (counts, ages, general quantities, years mentioned in prose, etc.). Render these as standard Western numerals (0-9), spelled out or as digits per normal English prose convention for the context.
+      2. REFERENCE NUMBERS - footnote markers, citation numbers, page numbers/references, volume/issue numbers, ISBNs, verse/hadith numbering used as an identifier, and dates used as a formal reference (e.g. a publication date in a citation). These function as identifiers/lookup keys, not narrative content - render them as standard Western digits but NEVER change, renumber, or reformat the actual value, so they still match their referent (e.g. the footnote list, the cited volume) exactly.
+      When Phase 2 structural metadata marks a block as a footnote or citation (see SOURCE BLOCK MAP below, when provided), treat its leading marker number as a REFERENCE NUMBER. When in doubt for an ambiguous number, prefer preserving it over converting it, since an incorrectly converted reference number breaks the reader's ability to find what it points to.
+`;
+  }
+  return `
+      --- NUMERAL HANDLING (BE DELIBERATE, NOT BLANKET) ---
+      Distinguish two categories of numbers before deciding whether to localize them to Bangla numerals:
+      1. NARRATIVE NUMBERS - numbers that are part of the flowing sentence content (counts, ages, general quantities, years mentioned in prose, etc.). Convert these to Bangla numerals as before.
+      2. REFERENCE NUMBERS - footnote markers, citation numbers, page numbers/references, volume/issue numbers, ISBNs, verse/hadith numbering used as an identifier, and dates used as a formal reference (e.g. a publication date in a citation). These function as identifiers/lookup keys, not narrative content - preserve their original digit form so they still match their referent (e.g. the footnote list, the cited volume) instead of converting them.
+      When Phase 2 structural metadata marks a block as a footnote or citation (see SOURCE BLOCK MAP below, when provided), treat its leading marker number as a REFERENCE NUMBER. When in doubt for an ambiguous number, prefer preserving it over converting it, since an incorrectly converted reference number breaks the reader's ability to find what it points to.
+`;
+};
+
+// PHASE 3: mixed RTL/LTR handling instructions - replaces the previous blind
+// "force everything to LTR" post-processing with explicit, scoped guidance.
+// Parameterized by target language name for the prose wording only; the
+// actual rule (page stays LTR, narrow embedded-quotation exception) is the
+// same regardless of target.
+const buildMixedDirectionInstructions = (targetCode) => {
+  const targetName = TARGET_LABELS[targetCode];
+  return `
+      --- MIXED DIRECTION TEXT (LOCAL RTL SPANS) ---
+      The overall page output stays LTR (${targetName} reads left-to-right) - keep outer <p>/<div> containers and their direction as specified below. However, if (per the Quranic-verse/Arabic-term handling elsewhere in this prompt) a short embedded original-script Arabic/Urdu excerpt is legitimately preserved alongside its ${targetName} rendering, wrap ONLY that embedded excerpt in its own inline element styled with dir="rtl" and style="direction: rtl; unicode-bidi: embed;" so it displays correctly in its own script, while the surrounding ${targetName} sentence and the page as a whole remain LTR. Never set rtl direction on an outer paragraph, heading, or page-level container - only on the specific embedded original-script span, and never as a substitute for translating the surrounding sentence into ${targetName}.
+`;
+};
+
+// PHASE 4: block-type -> accent color mapping, used only for the optional
+// diagnostics legend and for the best-effort visual accent pass below. This
+// does not alter translation content; it is a read-only presentation aid.
+const BLOCK_TYPE_ACCENTS = {
+  heading: { label: 'Heading', color: '#4338CA', bg: '#EEF2FF' },
+  header: { label: 'Header', color: '#64748B', bg: '#F1F5F9' },
+  footer: { label: 'Footer', color: '#64748B', bg: '#F1F5F9' },
+  page_number: { label: 'Page #', color: '#94A3B8', bg: '#F8FAFC' },
+  footnote: { label: 'Footnote', color: '#64748B', bg: '#F8FAFC' },
+  quote: { label: 'Quote', color: '#BE123C', bg: '#FFF1F2' },
+  religious_quote: { label: 'Religious Quote', color: '#BE123C', bg: '#FFF1F2' },
+  citation: { label: 'Citation', color: '#B45309', bg: '#FFFBEB' },
+  list_item: { label: 'List item', color: '#0F172A', bg: '#F8FAFC' },
+  paragraph: { label: 'Body', color: '#334155', bg: '#FFFFFF' }
+};
+
+// PHASE 5: pre-export structural validation. Read-only, non-destructive -
+// it never deletes or alters any page; it only reports issues so the user
+// can decide whether to proceed, fix a page, or export anyway.
+const validateExportStructure = (sections) => {
+  const warnings = [];
+
+  // duplicate page ids (defensive - should not normally occur)
+  const idCounts = {};
+  sections.forEach(s => { idCounts[s.id] = (idCounts[s.id] || 0) + 1; });
+  Object.entries(idCounts).forEach(([id, count]) => {
+    if (count > 1) {
+      warnings.push({ type: 'duplicate_page', pageId: id, message: `Page ${id} appears ${count} times in the document - this may produce duplicate exported sections.` });
+    }
+  });
+
+  sections.forEach(s => {
+    if (s.translationStatus !== 'done') {
+      warnings.push({
+        type: 'missing_translation',
+        pageId: s.id,
+        message: `Page ${s.id} has not been translated yet (status: ${s.translationStatus}) and will be skipped in the export.`
+      });
+      return;
+    }
+    const stripped = (s.translatedHtml || '').replace(/<[^>]*>/g, '').trim();
+    if (!s.translatedHtml || !s.translatedHtml.trim()) {
+      warnings.push({ type: 'empty_section', pageId: s.id, message: `Page ${s.id} is marked translated but has no content - it will export as an empty section.` });
+    } else if (stripped.length < 3 && !/No Text Found/i.test(stripped)) {
+      warnings.push({ type: 'malformed_section', pageId: s.id, message: `Page ${s.id}'s translated content looks malformed or unreadable.` });
+    }
+  });
+
+  return warnings;
+};
+
+const App = () => {
+  const [fileData, setFileData] = useState(null);
+  const [parsedSections, setParsedSections] = useState([]);
+  const [activeSectionId, setActiveSectionId] = useState(null);
+  const [isParsing, setIsParsing] = useState(false);
+  const [parseProgress, setParseProgress] = useState(0);
+  const [isExporting, setIsExporting] = useState(false);
+
+  const [sourceLangMode, setSourceLangMode] = useState('auto');
+  // targetLang: 'bn' (Bangla, valid for all 3 sources) or 'en' (English,
+  // valid for Arabic/Urdu sources only - English -> English is meaningless).
+  const [targetLang, setTargetLang] = useState('bn');
+  const [isTranslatingAll, setIsTranslatingAll] = useState(false);
+  const [progress, setProgress] = useState(0);
+
+  // PHASE 3: document-level glossary/terminology memory (source -> Bangla).
+  // Purely additive state; old sessions without it restore to [].
+  const [glossary, setGlossary] = useState([]);
+  // Ref mirror of `glossary` so in-flight async translation calls always read
+  // the latest merged glossary without waiting on a React re-render, the same
+  // pattern already used for rotationRef/pageImageCacheRef.
+  const glossaryRef = useRef([]);
+
+  const [apiKeys, setApiKeys] = useState(() => {
+    try {
+      const raw = sessionStorage.getItem('translator_api_keys') || localStorage.getItem('translator_api_keys');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length === TOTAL_API_KEY_SLOTS) return parsed;
+      }
+    } catch (e) {}
+    return Array(TOTAL_API_KEY_SLOTS).fill("");
+  });
+  const [rememberApiKey, setRememberApiKey] = useState(() => !!localStorage.getItem('translator_api_keys'));
+  const [showSettings, setShowSettings] = useState(false);
+  const [showHelpModal, setShowHelpModal] = useState(false);
+  const [copiedId, setCopiedId] = useState(null);
+
+  const [errorMsg, setErrorMsg] = useState(null);
+  const [successMsg, setSuccessMsg] = useState(null);
+
+  // PHASE 4: review mode ('target' | 'compare' | 'overlay') - additive, defaults to 'target'
+  // so existing behavior is unchanged unless the user explicitly switches mode.
+  const [reviewMode, setReviewMode] = useState('target');
+  const [overlayOpacity, setOverlayOpacity] = useState(0.55);
+  // PHASE 4: original page raster cache for Compare/Overlay modes, keyed by pageId.
+  const [sourcePageImages, setSourcePageImages] = useState({});
+  const [loadingSourceImage, setLoadingSourceImage] = useState(false);
+  // PHASE 4: per-page diagnostics panel toggle (collapsed by default, non-intrusive).
+  const [diagnosticsOpenFor, setDiagnosticsOpenFor] = useState({});
+
+  // PHASE 5: pre-export warnings modal state. Purely additive; export still
+  // works exactly as before when there are no warnings to show.
+  const [exportWarnings, setExportWarnings] = useState([]);
+  const [showExportWarningsModal, setShowExportWarningsModal] = useState(false);
+
+  const pdfDocRef = useRef(null);
+  const rotationRef = useRef({ keyIdx: 0, deadKeys: new Set() });
+  const throttleRef = useRef(Promise.resolve());
+  const pageImageCacheRef = useRef({});
+  const lastRequestTimeRef = useRef((() => {
+    try {
+      const saved = Number(localStorage.getItem(LAST_REQUEST_TIME_STORAGE_KEY));
+      return Number.isFinite(saved) ? saved : 0;
+    } catch (e) {
+      return 0;
+    }
+  })());
+  const hasRestoredSession = useRef(false);
+  const SESSION_STORAGE_KEY = 'translator_session_v2';
+  const editorContainerRef = useRef(null); // PHASE 4: for image control injection
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(SESSION_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && Array.isArray(parsed.parsedSections) && parsed.parsedSections.length > 0) {
+          const upgradedSections = parsed.parsedSections.map(s => ({
+            ...s,
+            previousTranslatedHtml: s.previousTranslatedHtml || "",
+            translationError: s.translationError || null,
+            retryCount: typeof s.retryCount === 'number' ? s.retryCount : 0,
+            structure: s.structure || null
+          }));
+          setFileData(parsed.fileData || null);
+          setParsedSections(upgradedSections);
+          setActiveSectionId(parsed.activeSectionId ?? upgradedSections[0].id);
+          setSourceLangMode(parsed.sourceLangMode || 'auto');
+          setTargetLang(parsed.targetLang || 'bn');
+          // PHASE 3: glossary restore - safe empty default for pre-Phase-3 sessions
+          const restoredGlossary = Array.isArray(parsed.glossary) ? parsed.glossary : [];
+          setGlossary(restoredGlossary);
+          glossaryRef.current = restoredGlossary;
+          setSuccessMsg("Restored your previous in-progress session.");
+        }
+      }
+    } catch (e) {
+      console.warn("Could not restore previous session:", e);
+    } finally {
+      hasRestoredSession.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hasRestoredSession.current) return;
+    try {
+      if (parsedSections.length > 0) {
+        // PHASE 3: glossary included in persisted session payload
+        const payload = JSON.stringify({ fileData, parsedSections, activeSectionId, sourceLangMode, targetLang, glossary });
+        localStorage.setItem(SESSION_STORAGE_KEY, payload);
+      } else {
+        localStorage.removeItem(SESSION_STORAGE_KEY);
+      }
+    } catch (e) {
+      console.warn("Could not persist session (storage quota likely exceeded):", e);
+    }
+  }, [fileData, parsedSections, activeSectionId, sourceLangMode, targetLang, glossary]);
+
+  // English target only makes sense for Arabic/Urdu sources (English -> English
+  // is meaningless) - force back to 'auto' if this combination is selected.
+  useEffect(() => {
+    if (targetLang === 'en' && sourceLangMode === 'en') {
+      setSourceLangMode('auto');
+    }
+  }, [targetLang, sourceLangMode]);
+
+  useEffect(() => {
+    const twScript = document.createElement('script');
+    twScript.src = 'https://cdn.tailwindcss.com';
+    document.head.appendChild(twScript);
+
+    const styleBlock = document.createElement('style');
+    styleBlock.type = 'text/tailwindcss';
+    styleBlock.innerHTML = `
+        @import "tailwindcss";
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
+        @import url('https://fonts.maateen.me/kalpurush/font.css');
+        @import url('https://fonts.googleapis.com/css2?family=Scheherazade+New:wght@400;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Naskh+Arabic:wght@400;600;700&display=swap');
+
+        @theme {
+          --font-bangla: "Kalpurush", sans-serif;
+          --font-arabic-urdu: "Scheherazade New", "Noto Naskh Arabic", serif;
+          --font-sans: "Plus Jakarta Sans", sans-serif;
+        }
+
+        body { 
+          @apply bg-slate-50 text-slate-900 font-sans antialiased; 
+        }
+        
+        .bangla-font { 
+          font-family: "Kalpurush", sans-serif !important; 
+        }
+
+        .translated-text-font {
+          font-family: "Times New Roman", Times, serif !important;
+        }
+
+        .arabic-urdu-font {
+          font-family: "Scheherazade New", "Noto Naskh Arabic", serif !important;
+        }
+
+        .english-font {
+          font-family: "Plus Jakarta Sans", sans-serif !important;
+        }
+        
+        .mirror-flow { 
+          @apply leading-relaxed tracking-normal bg-white p-6 md:p-8 rounded-xl border border-slate-100 transition-all; 
+        }
+
+        /* PHASE 4: high-fidelity target "page" presentation - centered, bounded width,
+           source-aspect-ratio aware, distinct rendering context per page. */
+        .phase4-page-shell {
+          @apply mx-auto bg-white rounded-lg border border-slate-200 shadow-lg;
+          width: 100%;
+          max-width: 880px;
+          position: relative;
+          isolation: isolate; /* independent stacking/rendering context per page */
+        }
+        .phase4-page-inner {
+          padding: 2.25rem 2rem;
+        }
+        .phase4-workspace-bg {
+          @apply bg-slate-100;
+        }
+
+        .phase4-diagram-controls {
+          display: flex;
+          gap: 6px;
+          justify-content: center;
+          margin-top: 8px;
+        }
+        .phase4-diagram-btn {
+          font-size: 10px;
+          font-weight: 700;
+          padding: 4px 10px;
+          border-radius: 8px;
+          cursor: pointer;
+          border: 1px solid transparent;
+        }
+        .phase4-diagram-btn.replace {
+          background: #EEF2FF;
+          color: #4338CA;
+          border-color: #E0E7FF;
+        }
+        .phase4-diagram-btn.replace:hover { background: #E0E7FF; }
+        .phase4-diagram-btn.remove {
+          background: #FEF2F2;
+          color: #B91C1C;
+          border-color: #FEE2E2;
+        }
+        .phase4-diagram-btn.remove:hover { background: #FEE2E2; }
+
+        ::-webkit-scrollbar {
+          width: 6px;
+          height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+          @apply bg-transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+          @apply bg-slate-200 rounded-full hover:bg-slate-300;
+        }
+    `;
+    document.head.appendChild(styleBlock);
+
+    const pdfScript = document.createElement('script');
+    pdfScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js';
+    pdfScript.onload = () => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+    };
+    document.head.appendChild(pdfScript);
+
+    const purifyScript = document.createElement('script');
+    purifyScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js';
+    document.head.appendChild(purifyScript);
+
+    return () => {
+      [twScript, styleBlock, pdfScript, purifyScript].forEach(el => el?.remove());
+    };
+  }, []);
+
+  // PHASE 5: sanitizeHtml hardened - explicit allowance for structured content
+  // introduced in Phases 2-4 (table markup, local RTL spans, block-id markers,
+  // phase4 asset index markers) so nothing legitimate is stripped on export,
+  // while still using DOMPurify (not regex) as the primary sanitizer and never
+  // widening it to unsafe tags/attributes (no <script>, no on*=, no iframes).
+  const sanitizeHtml = useCallback((html) => {
+    if (!html) return html;
+    if (window.DOMPurify) {
+      return window.DOMPurify.sanitize(html, {
+        ADD_TAGS: ['input', 'table', 'thead', 'tbody', 'tr', 'td', 'th'],
+        ADD_ATTR: ['class', 'accept', 'type', 'dir', 'style', 'data-block-id', 'data-phase4-asset-index', 'colspan', 'rowspan']
+      });
+    }
+    return html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/ on[a-z]+="[^"]*"/gi, '')
+      .replace(/ on[a-z]+='[^']*'/gi, '');
+  }, []);
+
+  useEffect(() => {
+    const handleFileSelect = (e) => {
+      if (e.target && e.target.classList.contains('diagram-upload-input')) {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const base64 = event.target.result;
+          const liveContainer = e.target.closest('.diagram-placeholder');
+          const editorDiv = e.target.closest('[id^="translation-editor-"]');
+
+          if (liveContainer && editorDiv) {
+            const allLivePlaceholders = Array.from(editorDiv.querySelectorAll('.diagram-placeholder'));
+            const placeholderIndex = allLivePlaceholders.indexOf(liveContainer);
+
+            const detachedRoot = editorDiv.cloneNode(true);
+            const detachedPlaceholders = Array.from(detachedRoot.querySelectorAll('.diagram-placeholder'));
+            const detachedContainer = (placeholderIndex >= 0 && detachedPlaceholders[placeholderIndex])
+              ? detachedPlaceholders[placeholderIndex]
+              : (detachedRoot.querySelector('.diagram-placeholder') || detachedRoot);
+
+            // PHASE 4: preserve the original detected visual element's approximate
+            // position/size (Phase 2 metadata) on the replacement image where available,
+            // instead of only relying on the placeholder's natural document-flow position.
+            const pageIdForAsset = parseInt(editorDiv.id.replace('translation-editor-', ''), 10);
+            const pageForAsset = window.__phase4ParsedSectionsRef
+              ? window.__phase4ParsedSectionsRef.find(s => s.id === pageIdForAsset)
+              : null;
+            const assetMeta = pageForAsset?.structure?.visualAssets?.[placeholderIndex] || null;
+            const hasKnownSize = assetMeta && assetMeta.width && assetMeta.height;
+            const imgStyle = hasKnownSize
+              ? `max-width: 100%; width: ${Math.min(assetMeta.width, 700)}px; height: auto; aspect-ratio: ${assetMeta.width} / ${assetMeta.height}; border-radius: 8px; display: block; margin: 0 auto; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);`
+              : `max-width: 100%; max-height: 400px; border-radius: 8px; display: block; margin: 0 auto; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);`;
+
+            detachedContainer.innerHTML = `<img src="${base64}" data-phase4-asset-index="${placeholderIndex}" style="${imgStyle}" alt="Uploaded Diagram" />`;
+            detachedContainer.style.border = 'none';
+            detachedContainer.style.background = 'transparent';
+            detachedContainer.style.padding = '0';
+
+            const pageId = pageIdForAsset;
+
+            const customEvent = new CustomEvent('diagramUploaded', {
+              detail: { pageId, newHtml: detachedRoot.innerHTML }
+            });
+            document.dispatchEvent(customEvent);
+          }
+        };
+        reader.readAsDataURL(file);
+      }
+    };
+
+    const handleDiagramStateUpdate = (e) => {
+      const { pageId, newHtml } = e.detail;
+      setParsedSections(prev => prev.map(s => (s.id === pageId ? { ...s, translatedHtml: newHtml } : s)));
+    };
+
+    document.addEventListener('change', handleFileSelect);
+    document.addEventListener('diagramUploaded', handleDiagramStateUpdate);
+
+    return () => {
+      document.removeEventListener('change', handleFileSelect);
+      document.removeEventListener('diagramUploaded', handleDiagramStateUpdate);
+    };
+  }, []);
+
+  // PHASE 4: keep a window-level mirror of parsedSections so the (module-scope)
+  // file-select handler above can look up Phase 2 visual asset geometry for the
+  // page/placeholder being replaced, without changing that handler's existing
+  // detached-clone replacement approach (protected item #35).
+  useEffect(() => {
+    window.__phase4ParsedSectionsRef = parsedSections;
+  }, [parsedSections]);
+
+  const extractPageImageBase64 = async (pageId) => {
+    if (pageImageCacheRef.current[pageId]) {
+      return pageImageCacheRef.current[pageId];
+    }
+    if (!pdfDocRef.current) return null;
+    try {
+      const page = await pdfDocRef.current.getPage(pageId);
+      // PHASE 4: raised render scale (2.0 -> 3.0) and JPEG quality (0.85 -> 0.94)
+      // so small Arabic/Urdu diacritics, footnotes, seals, and logos stay legible.
+      // Still cached exactly as before (item #58 protected) - no repeated re-render cost.
+      const viewport = page.getViewport({ scale: 3.0 });
+      const canvas = document.createElement('canvas');
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      const base64 = canvas.toDataURL('image/jpeg', 0.94).split(',')[1];
+      pageImageCacheRef.current[pageId] = base64;
+      return base64;
+    } catch (e) {
+      console.warn("Visual image extraction skipped for page", pageId, e);
+      return null;
+    }
+  };
+
+  // PHASE 4: fetch (and cache in component state) the full-page raster for
+  // Compare/Overlay modes. Reuses the same cache/extraction function above -
+  // no duplicate rendering pipeline.
+  const ensureSourcePageImage = useCallback(async (pageId) => {
+    if (!pageId || sourcePageImages[pageId]) return;
+    setLoadingSourceImage(true);
+    try {
+      const base64 = await extractPageImageBase64(pageId);
+      if (base64) {
+        setSourcePageImages(prev => ({ ...prev, [pageId]: base64 }));
+      }
+    } finally {
+      setLoadingSourceImage(false);
+    }
+  }, [sourcePageImages]);
+
+  useEffect(() => {
+    if ((reviewMode === 'compare' || reviewMode === 'overlay') && activeSectionId) {
+      ensureSourcePageImage(activeSectionId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewMode, activeSectionId]);
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    setErrorMsg(null);
+    setSuccessMsg(null);
+
+    const fileName = file.name.toLowerCase();
+    const isPdf = fileName.endsWith('.pdf');
+
+    if (!isPdf) {
+      setErrorMsg("Invalid format. Please upload a PDF document.");
+      return;
+    }
+
+    if (file.size > 100 * 1024 * 1024) {
+      setErrorMsg("File size exceeds 100MB limit. Please upload a smaller document.");
+      return;
+    }
+
+    if (!window.pdfjsLib) {
+      setErrorMsg("PDF Engine initializing. Please try again in a few seconds.");
+      return;
+    }
+
+    pageImageCacheRef.current = {};
+    setSourcePageImages({}); // PHASE 4: reset cached source rasters for the new document
+    // PHASE 3: a brand-new document starts a fresh glossary too, since
+    // terminology consistency is scoped per document.
+    setGlossary([]);
+    glossaryRef.current = [];
+
+    setFileData({ name: file.name, size: (file.size / (1024 * 1024)).toFixed(2) });
+    setIsParsing(true);
+    setParseProgress(0);
+
+    try {
+      const sections = [];
+
+      if (isPdf) {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        pdfDocRef.current = pdf;
+
+        for (let i = 1; i <= pdf.numPages; i++) {
+          if (i % 5 === 0) {
+            setParseProgress(Math.round((i / pdf.numPages) * 100));
+            await new Promise(resolve => setTimeout(resolve, 0));
+          }
+
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          const baseViewport = page.getViewport({ scale: 1.0 });
+          const pageWidth = baseViewport.width;
+          const pageHeight = baseViewport.height;
+
+          const isRtlPage = sourceLangMode === 'ar_ur';
+          const positionedItems = textContent.items
+            .filter(item => item.str !== undefined)
+            .map((item, sourceIndex) => ({
+              str: item.str,
+              x: item.transform ? item.transform[4] : 0,
+              y: item.transform ? item.transform[5] : 0,
+              width: item.width || 0,
+              height: item.height || (item.transform ? Math.hypot(item.transform[2], item.transform[3]) : 0),
+              transform: item.transform || null,
+              fontName: item.fontName || null,
+              fontSize: item.transform ? Math.hypot(item.transform[2], item.transform[3]) : null,
+              sourceIndex
+            }));
+
+          const lineTolerance = 3;
+          const sortedForRawText = [...positionedItems].sort((a, b) => {
+            if (Math.abs(a.y - b.y) > lineTolerance) return b.y - a.y;
+            return isRtlPage ? b.x - a.x : a.x - b.x;
+          });
+
+          let pageRawText = sortedForRawText.map(item => item.str).join(" ");
+
+          const lines = groupItemsIntoLines(positionedItems, lineTolerance);
+          const avgFontSize = lines.reduce((sum, l) => sum + (l.fontSize || 0), 0) / (lines.length || 1);
+
+          const columnInfo = detectColumns(lines, pageWidth);
+          const orderedLines = buildColumnReadingOrder(lines, columnInfo, isRtlPage);
+          if (columnInfo.columnCount > 1) {
+            pageRawText = orderedLines.map(l => l.text).join(" ");
+          }
+
+          const blocks = classifyBlocks(orderedLines, i, pageHeight, avgFontSize);
+          const tableCandidates = detectTableCandidates(orderedLines, pageWidth);
+          const footnoteMeta = buildFootnoteMetadata(blocks);
+          const continuation = detectLikelyContinuation(blocks);
+          const visualAssets = await extractVisualAssetMetadata(page, i);
+
+          const structure = {
+            pageGeometry: {
+              width: pageWidth,
+              height: pageHeight,
+              aspectRatio: pageHeight ? pageWidth / pageHeight : null,
+              orientation: pageWidth >= pageHeight ? 'landscape' : 'portrait'
+            },
+            lines: orderedLines.map(l => ({
+              lineIndex: l.lineIndex,
+              x: l.x,
+              y: l.y,
+              width: l.width,
+              height: l.height,
+              fontSize: l.fontSize,
+              text: l.text
+            })),
+            columns: columnInfo,
+            blocks,
+            tableCandidates,
+            footnotes: footnoteMeta,
+            continuation,
+            visualAssets
+          };
+
+          sections.push({
+            id: i,
+            meta: { partName: `Page ${i}` },
+            content: { rawText: pageRawText },
+            translatedHtml: "",
+            originalTranslatedHtml: "",
+            previousTranslatedHtml: "",
+            translationError: null,
+            retryCount: 0,
+            translationStatus: 'idle',
+            isPdf: true,
+            structure
+          });
+        }
+      }
+
+      const withRepetition = computeRepeatedHeaderFooterMetadata(
+        sections.map(s => ({ id: s.id, blocks: s.structure?.blocks || [] }))
+      );
+      withRepetition.forEach((rep, idx) => {
+        if (sections[idx] && sections[idx].structure) {
+          sections[idx].structure.repeatedHeaderFooter = rep.repeatedHeaderFooter;
+        }
+      });
+
+      if (sections.length > 0) {
+        console.info(
+          `[PHASE 2] Parsed ${sections.length} page(s). Example structure for page 1:`,
+          sections[0].structure
+        );
+      }
+
+      setParsedSections(sections);
+      if (sections.length > 0) {
+        setActiveSectionId(sections[0].id);
+        setSuccessMsg("Document loaded successfully! Ready for translation.");
+      } else {
+        setErrorMsg("No readable text found in the uploaded file.");
+      }
+    } catch (error) {
+      console.error(error);
+      setErrorMsg("Error reading the file. Please verify the document.");
+    } finally {
+      setIsParsing(false);
+    }
+  };
+
+  const scheduleRequestSlot = () => {
+    const slot = throttleRef.current.then(async () => {
+      const now = Date.now();
+      const wait = REQUEST_INTERVAL_MS - (now - lastRequestTimeRef.current);
+      if (wait > 0) {
+        await new Promise(resolve => setTimeout(resolve, wait));
+      }
+      lastRequestTimeRef.current = Date.now();
+      try {
+        localStorage.setItem(LAST_REQUEST_TIME_STORAGE_KEY, String(lastRequestTimeRef.current));
+      } catch (e) { /* storage quota or unavailable - pacing still works in-memory */ }
+    });
+    throttleRef.current = slot.catch(() => {});
+    return slot;
+  };
+
+  // callMistral keeps the exact same (Gemini-shaped) call signature and
+  // return value as the old callGemini did - callers still pass a Gemini-style
+  // `parts` array ([{text}, {inlineData:{mimeType,data}}]) and still read the
+  // reply back out as data.candidates[0].content.parts[0].text. Internally it
+  // now: (1) converts that into Mistral's message/content format, (2) sends
+  // it to our own CORS proxy (never directly to api.mistral.ai - browsers
+  // can't call that API cross-origin), and (3) reshapes Mistral's reply back
+  // into the Gemini response shape before returning. This means NONE of the
+  // downstream logic (glossary parsing, diagnostics, validation, etc.) had to
+  // change - only this one function's internals did.
+  const callMistral = async (parts) => {
+    const activeKeys = apiKeys.map(k => k.trim()).filter(Boolean);
+    if (activeKeys.length === 0) {
+      throw new Error("NO_API_KEY");
+    }
+
+    const acquireSlot = scheduleRequestSlot;
+    const rot = rotationRef.current;
+
+    if (rot.keyIdx >= activeKeys.length) rot.keyIdx = 0;
+
+    const content = parts.map(p => {
+      if (p && typeof p.text === 'string') {
+        return { type: 'text', text: p.text };
+      }
+      if (p && p.inlineData) {
+        return {
+          type: 'image_url',
+          image_url: { url: `data:${p.inlineData.mimeType};base64,${p.inlineData.data}` }
+        };
+      }
+      return null;
+    }).filter(Boolean);
+
+    let attempts = 0;
+    const maxAttempts = activeKeys.length;
+
+    while (attempts < maxAttempts) {
+      while (rot.deadKeys.has(rot.keyIdx) && rot.deadKeys.size < activeKeys.length) {
+        rot.keyIdx = (rot.keyIdx + 1) % activeKeys.length;
+      }
+      if (rot.deadKeys.size >= activeKeys.length) {
+        throw new Error("ALL_KEYS_EXHAUSTED");
+      }
+
+      const activeKey = activeKeys[rot.keyIdx];
+
+      try {
+        const data = await fetchWithRetry(MISTRAL_API_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${activeKey}`
+          },
+          body: JSON.stringify({ model: MISTRAL_MODEL, messages: [{ role: 'user', content }] })
+        }, 60000, acquireSlot);
+
+        // Reshape Mistral's { choices: [{ message: { content } }] } reply
+        // into the Gemini { candidates: [{ content: { parts: [{ text }] } }] }
+        // shape every downstream caller already expects.
+        const replyText = data?.choices?.[0]?.message?.content || "";
+        return { candidates: [{ content: { parts: [{ text: replyText }] } }] };
+      } catch (error) {
+        const status = error.status;
+        const isQuotaError = status === 429 || /rate.?limit|quota/i.test(error.message || "");
+        const isKeyError = status === 400 || status === 401 || status === 403 || /invalid_api_key|unauthorized|permission|tier_not_allowed/i.test(error.message || "");
+
+        if (isQuotaError) {
+          if (error.retryAfterMs && error.retryAfterMs > 0) {
+            const waitMs = Math.min(error.retryAfterMs, MAX_RETRY_AFTER_MS);
+            await new Promise(resolve => setTimeout(resolve, waitMs));
+          }
+          // Rotate to next key; this key is NOT marked dead, it may recover
+          // on a later cycle (e.g. next billing period / limit reset).
+          rot.keyIdx = (rot.keyIdx + 1) % activeKeys.length;
+          attempts += 1;
+          continue;
+        }
+
+        if (isKeyError) {
+          rot.deadKeys.add(rot.keyIdx);
+          rot.keyIdx = (rot.keyIdx + 1) % activeKeys.length;
+          attempts += 1;
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    throw new Error("ALL_KEYS_EXHAUSTED");
+  };
+
+  // PHASE 3: translatePage now also accepts this page's structure,
+  // the previous page's structure (for small cross-page context), and the
+  // current glossary list, so the prompt can add block correspondence,
+  // context, numeral, mixed-direction, and glossary-consistency guidance on
+  // top of the existing (protected) anti-substitution prompt. All new
+  // sections are optional and degrade to the original whole-page prompt
+  // behavior when structure/glossary data isn't available.
+  const translatePage = async (pageText, pageId, isPdf, structure = null, prevPageStructure = null, glossaryList = []) => {
+    let imagePayload = null;
+    if (isPdf) {
+      const base64Image = await extractPageImageBase64(pageId);
+      if (base64Image) {
+        imagePayload = {
+          inlineData: {
+            mimeType: "image/jpeg",
+            data: base64Image
+          }
+        };
+      }
+    }
+
+    const langInstruction = sourceLangMode === 'ar_ur'
+      ? "SOURCE LANGUAGE: Arabic / Urdu."
+      : sourceLangMode === 'en'
+      ? "SOURCE LANGUAGE: English."
+      : "SOURCE LANGUAGE: Auto-detect (Arabic, Urdu, or English).";
+
+    // PHASE 3: block-to-translation correspondence (item #9)
+    const blockMapSection = buildBlockMapPromptSection(structure);
+    // PHASE 3: small, targeted document-level context (item #21)
+    const contextSection = buildContextPromptSection(structure, prevPageStructure);
+    // PHASE 3: glossary excerpt for terminology consistency (item #20)
+    const glossaryExcerpt = buildGlossaryPromptExcerpt(glossaryList);
+    // PHASE 3: repeated header/footer consistency hint (item #14 behavior)
+    const repeatedMetadataHints = buildRepeatedMetadataPromptSection(structure, glossaryList);
+
+    const targetName = TARGET_LABELS[targetLang];
+    const prompt = `
+      READ THIS SOURCE PAGE (ARABIC / URDU / ENGLISH) AND PRODUCE ITS 100% MIRRORED ${targetName.toUpperCase()} TRANSLATION AS STYLED HTML, IN ONE SINGLE PASS.
+
+      ROLE: You are an expert scholarly translator. Your single most important job, above everything else in this prompt, is: translate exactly the sentence that is actually printed, in exactly the place it is printed, into faithful ${targetName} - never a different (even if related) sentence from elsewhere on the page.
+      ${langInstruction}
+
+      ============================================================
+      RULE #1 - THE MOST IMPORTANT RULE - NO CONTENT SUBSTITUTION (READ THIS FIRST, APPLY IT ABOVE ALL ELSE)
+      ============================================================
+      This document contains dense, technical, citation-heavy academic/religious content (hadith science terminology, multi-narrator citation chains, scholarly argumentation). On pages like this, there is a known failure mode where a translator (human or AI) under cognitive load accidentally substitutes a DIFFERENT nearby sentence - often a quotation, footnote, or an adjacent paragraph discussing a related concept - in place of the sentence that was actually supposed to be translated at that position. This is a much more serious error than a wrong word choice: it silently replaces the meaning of an entire paragraph.
+      YOU MUST ACTIVELY GUARD AGAINST THIS. For every paragraph, before finalizing its ${targetName} translation, re-confirm: "Is this translation actually derived from THIS SPECIFIC paragraph's own words, or did I drift into translating a different quotation/footnote/paragraph that happens to be nearby and discusses a similar topic?" If you notice any drift, discard it and re-translate strictly from the actual source sentence at that position, even if the correct translation reads as less polished, less complete, or less like a "clean quotable passage" than the substituted version would have.
+      When a paragraph contains an embedded quotation (e.g. «...» or "..."), translate the quotation as part of that paragraph, in that exact position - do not let a quotation's content bleed into a neighboring paragraph, and do not let a neighboring paragraph's content bleed into the quotation.
+      This rule OVERRIDES any instinct to produce smoother-sounding or more "complete" ${targetName} text. A literal, faithful translation of the correct sentence is always better than a fluent translation of the wrong sentence.
+      ${blockMapSection ? `
+      --- SOURCE BLOCK MAP (BLOCK-TO-TRANSLATION CORRESPONDENCE) ---
+      The source page has been pre-segmented into the following structural blocks (id, type, and a short text snippet for identification only - always translate from the FULL source text/image, this snippet is just to locate the block). Use each block's OWN text as the sole source for its own translation - never let one block's content substitute for another's, especially between a "footnote"/"citation"/"quote" block and a nearby "paragraph" block. Where practical, mark the top-level HTML element you produce for each block with a matching data-block-id="<id>" attribute (in addition to its required inline style), so correspondence can be verified:
+${blockMapSection}
+` : ''}
+      ${contextSection ? `
+      --- DOCUMENT-LEVEL CONTEXT (FOR CONSISTENCY ONLY - DOES NOT REPLACE THIS PAGE'S OWN TEXT AS SOURCE OF TRUTH) ---
+${contextSection}
+` : ''}
+      ${glossaryExcerpt ? `
+      --- APPROVED TERMINOLOGY GLOSSARY (USE FOR CONSISTENCY - A HINT, NOT A FORCED SUBSTITUTION) ---
+      These ${targetName} renderings have already been used elsewhere in this document for the following source terms. Reuse them when the SAME term appears again with the SAME meaning, for consistency. If a term's correct meaning clearly differs in this new context, translate it correctly instead of forcing the glossary entry:
+${glossaryExcerpt}
+` : ''}
+      ${repeatedMetadataHints ? `
+      --- REPEATED HEADER/FOOTER TEXT - KEEP WORDING CONSISTENT ---
+      This document's structural scan detected that the following header/footer/publisher text repeats across multiple pages. Use the exact same ${targetName} wording shown below rather than re-wording it independently on this page:
+${repeatedMetadataHints}
+` : ''}
+
+      ============================================================
+      RULE #2 - NEVER OUTPUT THE ORIGINAL-LANGUAGE TEXT
+      ============================================================
+      The original Arabic/Urdu/English source text must NEVER appear anywhere in your output as a substitute for translation - only the ${targetName} translation is the deliverable, even for the densest citation-chain passages. (See the MIXED DIRECTION section below for the narrow, explicitly-marked exception of a short embedded original-script liturgical quotation kept alongside its ${targetName} rendering - that is not "leaving text untranslated", it is a deliberate scholarly convention already called for elsewhere in this prompt.)
+
+      RAW TEXT CONTENT (extracted from the page's text layer - may be empty/garbled if this is a scanned/image-only page):
+      """
+      ${pageText}
+      """
+
+      --- IMAGE OCR & BLANK PAGE HANDLING ---
+      If "RAW TEXT CONTENT" is empty, garbage, or incomplete (e.g. a scanned image-only PDF), rely ENTIRELY on the provided page image to perform OCR and read the full source text accurately before translating.
+      If the image and text BOTH contain no readable content (a genuinely blank page), ignore all layout rules and output EXACTLY:
+      <p style="text-align: center; color: #94A3B8; font-style: italic; font-size: 16px; margin-top: 40px;">No Text Found</p>
+
+      --- LAYOUT FIDELITY ---
+      Preserve the EXACT paragraph breaks, lists, tables, and physical structure of the original page - do not re-order, combine, or split paragraphs, and do not summarize, omit, or add any text or meaning that isn't in the source. Only the LANGUAGE changes, to ${targetName}; the structure stays a 1:1 mirror.
+
+      --- TRANSLATE EVERY VISIBLE TEXT ELEMENT - NO EXCEPTIONS ---
+      Every visible piece of text on the page must be translated, including running headers/footers, journal/publication names, issue numbers, dates, and page numbers (small metadata strips at the top/bottom included). Nothing is left in the original language anywhere on the page (outside the narrow embedded-quotation exception below).
+${buildNumeralHandlingInstructions(targetLang)}
+      --- FOOTNOTE HANDLING ---
+      Read the body text first, keeping every footnote reference marker (superscript number/symbol) exactly in place - the marker is a structural element and must survive into the translation (as a REFERENCE NUMBER, see numeral handling above), but the footnote's MEANING must never be used to complete, clarify, or supplement the body (see RULE #1 above: proximity to a footnote is exactly the kind of situation where content substitution/bleeding happens - stay anchored to the body's own actual sentence). Read and translate the footnote block separately. Cross-check that every marker in the body has a matching footnote entry and vice versa. After drafting, compare body vs. footnote translations sentence-by-sentence: if any exact sentence appears in both, that's an error - remove the duplicate from the body and restore the body's own faithful (possibly cut-off) translation.
+
+      --- NO INVENTED COMPLETIONS ---
+      If a sentence, heading, or list item appears cut off at the bottom of the page, translate it AS CUT OFF - do not invent a completion from your own knowledge (even of a well-known hadith/verse), and do not add trailing punctuation that wasn't in the source.
+${buildMixedDirectionInstructions(targetLang)}
+      --- DEDICATED VISUAL SCAN STEP ---
+      Separately from reading the text, visually scan the ENTIRE page image for any non-text visual element: photographs, diagrams, charts, graphs, maps, tables-as-images, illustrations, icons, stamps, seals, logos, letterheads, infographics, screenshots, decorative borders/dividers. Logos/seals/stamps are the most commonly missed - they are often small, subtle, monochrome, or near a title, and can be mistaken for decorative heading design; check for them specifically rather than assuming a mark near a title is just styling.
+      For EACH element found, output this EXACT HTML in its correct spatial place:
+      <div class="diagram-placeholder" style="border: 2px dashed #CBD5E1; padding: 20px; text-align: center; border-radius: 8px; margin: 16px 0;"><p style="font-size: 14px; color: #64748B; margin-bottom: 8px;">Image Detected. Click to upload replacement.</p><input type="file" accept="image/*" class="diagram-upload-input" /></div>
+
+      --- BEAUTIFICATION & STYLING (INLINE CSS ONLY, OUTPUT IS ${targetName.toUpperCase()}) ---
+      Output text is always ${targetName}, and the page as a whole is always LTR (direction: ltr;) regardless of source direction - see MIXED DIRECTION above for the narrow local-span exception.
+      1. Heading 1: <p style="text-align: center; color: #4338CA; font-size: 24px; font-weight: bold; margin-bottom: 20px;">...</p>
+      2. Heading 2: <p style="color: #0F172A; font-size: 20px; font-weight: bold; margin-bottom: 12px; border-bottom: 1px solid #E2E8F0; padding-bottom: 8px;">...</p>
+      3. Body text: <p style="text-align: justify; color: #334155; font-size: 18px; line-height: 1.8; margin-bottom: 16px;">...</p>
+      4. Highlights: <span style="color: #BE123C; font-weight: bold;">...</span> for emphasis/Quranic verses/key terms.
+      5. Footnotes: <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;"><p style="color: #64748B; font-size: 14px;">...</p></div>
+      6. Preserve Quranic verses / Arabic religious terms with standard ${targetName} transliteration or brief explanation where appropriate.
+
+      DO NOT use markdown code blocks (\`\`\`html). Output raw styled HTML directly.
+
+      --- GLOSSARY SUGGESTIONS (APPEND AFTER THE HTML) ---
+      After the closing HTML, on a new line by itself, append a line in EXACTLY this format:
+      GLOSSARY_JSON:[{"source":"<original-language term>","translated":"<approved ${targetName} rendering>"}, ...]
+      List at most 8 important recurring proper nouns, names, or technical/religious terms from THIS page (if any) whose ${targetName} rendering should stay consistent if they reappear on later pages. If none are notable, output exactly: GLOSSARY_JSON:[]
+      This line must come AFTER all the HTML and must be the very last thing in your response.
+    `;
+
+    const data = await callMistral([
+      { text: prompt },
+      ...(imagePayload ? [imagePayload] : [])
+    ]);
+
+    let rawResponse = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").replace(/```html|```/gi, '').trim();
+
+    // PHASE 3: extract any trailing glossary suggestions before returning the
+    // cleaned HTML. Suggestions are handed back alongside the HTML so callers
+    // can merge them into the document glossary.
+    const { cleanedHtml, suggestions } = parseGlossarySuggestionsFromResponse(rawResponse);
+
+    // PHASE 3: the previous blanket "force every direction:rtl / text-align:right
+    // to ltr" post-processing has been REMOVED here on purpose (per instructions:
+    // do not globally replace RTL with LTR anywhere). The page-level LTR
+    // requirement is now enforced only by the prompt above plus the existing
+    // outer container styling (contentEditable div and export wrapper both
+    // already force `direction: ltr` at the container level), which leaves
+    // room for legitimate local dir="rtl" spans inside the output.
+
+    return { html: cleanedHtml, glossarySuggestions: suggestions };
+  };
+
+  // Verification & auto-correction pass.
+  const verifyAndCorrectTranslation = async (pageText, pageId, isPdf, translatedHtmlDraft) => {
+    let imagePayload = null;
+    if (isPdf) {
+      const base64Image = await extractPageImageBase64(pageId);
+      if (base64Image) {
+        imagePayload = {
+          inlineData: {
+            mimeType: "image/jpeg",
+            data: base64Image
+          }
+        };
+      }
+    }
+
+    const verifyTargetName = TARGET_LABELS[targetLang];
+    const prompt = `
+      YOU ARE A PROOFREADER/AUDITOR, NOT A TRANSLATOR. Your job is to CHECK an existing ${verifyTargetName} translation against its original source page, and fix ONLY real errors you find - not to re-translate from scratch or rewrite style choices you simply would have phrased differently.
+
+      ORIGINAL SOURCE PAGE TEXT (Arabic / Urdu / English - also see attached page image if provided):
+      """
+      ${pageText}
+      """
+
+      EXISTING ${verifyTargetName.toUpperCase()} TRANSLATION HTML TO AUDIT:
+      """
+      ${translatedHtmlDraft}
+      """
+
+      Check specifically for these failure modes, one by one:
+      1. CONTENT SUBSTITUTION: does each paragraph's ${verifyTargetName} actually correspond to THAT SAME paragraph's source text, or did content drift in from a nearby quotation, footnote, or adjacent paragraph discussing a related topic?
+      2. HALLUCINATION / INVENTED COMPLETIONS: did the translation add words, sentences, or punctuation not present in the source - especially completing a sentence that was actually cut off at the bottom of the page?
+      3. FOOTNOTE MARKERS: does every footnote reference marker (superscript number/symbol) in the body have a matching footnote entry, and vice versa? Did any footnote's meaning bleed into the body text (or an identical sentence appear in both)?
+      4. ORIGINAL-LANGUAGE LEFTOVERS: does any Arabic/Urdu/English text remain anywhere in the output that should have been translated to ${verifyTargetName} (outside a deliberately marked, narrow embedded-quotation exception)?
+      5. VISUAL ELEMENT PLACEHOLDERS: compare the page image (if provided) against the HTML - is any photograph, diagram, chart, graph, map, table-as-image, illustration, icon, stamp, seal, or logo visible on the page missing its placeholder <div class="diagram-placeholder">...</div> block?
+      6. HEADERS/FOOTERS/PAGE NUMBERS: is every peripheral text element (running header/footer, journal name, issue number, date, page number) fully translated to ${verifyTargetName}, using narrative-numeral conventions rather than reference-numeral ones?
+      7. NUMERAL HANDLING: were any REFERENCE numbers (footnote markers, citation numbers, page/volume/issue numbers used as identifiers) incorrectly converted or reformatted when they should have been preserved exactly as identifiers?
+
+      OUTPUT RULES:
+      - If you find NO issues after checking all seven points above, respond with EXACTLY this sentinel text and nothing else: NO_CORRECTIONS_NEEDED
+      - If you find ANY issue, respond with the FULL corrected HTML (same format/styling conventions as the input - styled <p>/<div>/<span> tags, ${verifyTargetName} text, page-level LTR direction with only narrow local dir="rtl" spans where explicitly appropriate), with ONLY the specific errors fixed. Do not rewrite or rephrase parts that were already correct - preserve everything that wasn't actually wrong.
+      - Do not use markdown code blocks. Output either the sentinel text alone, or raw HTML alone - never both, never any other commentary.
+    `;
+
+    try {
+      const data = await callMistral([
+        { text: prompt },
+        ...(imagePayload ? [imagePayload] : [])
+      ]);
+
+      let rawText = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").replace(/```html|```/gi, '').trim();
+
+      if (!rawText || /^NO_CORRECTIONS_NEEDED$/i.test(rawText)) {
+        return translatedHtmlDraft;
+      }
+
+      // PHASE 3: blanket RTL->LTR force-replacement removed here too, for the
+      // same reason as in translatePage - see comment there.
+
+      return rawText;
+    } catch (e) {
+      console.error("Verification error:", e);
+      return translatedHtmlDraft;
+    }
+  };
+
+  // PHASE 3: batch loop now carries each page's structure (for block map /
+  // context) and looks up the previous page's structure by array position,
+  // and merges any glossary suggestions returned per page into glossaryRef /
+  // glossary state so later pages in the same batch benefit immediately.
+  const startSequentialAnalysis = async () => {
+    if (isTranslatingAll) return;
+    setIsTranslatingAll(true);
+    setErrorMsg(null);
+    setSuccessMsg(null);
+
+    const pageQueue = parsedSections.map(p => ({
+      id: p.id,
+      rawText: p.content.rawText,
+      isPdf: p.isPdf,
+      status: p.translationStatus,
+      structure: p.structure || null
+    }));
+    const totalPages = pageQueue.length;
+
+    for (let i = 0; i < totalPages; i++) {
+      const { id: pageId, rawText, isPdf, status, structure } = pageQueue[i];
+      const prevPageStructure = i > 0 ? pageQueue[i - 1].structure : null;
+
+      if (status !== 'done') {
+        setParsedSections(prev => prev.map(s => (
+          s.id === pageId ? { ...s, translationStatus: 'loading', translationError: null } : s
+        )));
+
+        let translatedHtmlResult = null;
+        let failureReason = null;
+        try {
+          const result = await translatePage(rawText, pageId, isPdf, structure, prevPageStructure, glossaryRef.current);
+          const validation = validateTranslationResult(result.html, rawText);
+          if (validation.valid) {
+            translatedHtmlResult = result.html;
+            // PHASE 3: merge this page's glossary suggestions immediately so
+            // subsequent pages in this same batch see them via glossaryRef.
+            const merged = mergeGlossaryEntries(glossaryRef.current, result.glossarySuggestions);
+            glossaryRef.current = merged;
+            setGlossary(merged);
+          } else {
+            failureReason = validation.reason;
+          }
+        } catch (e) {
+          console.error("Translation error:", e);
+          if (e.message === 'NO_API_KEY') {
+            failureReason = "Please enter at least one Mistral API key in Settings.";
+          } else if (e.message === 'ALL_KEYS_EXHAUSTED') {
+            failureReason = "All Mistral API keys have reached their limit or are invalid. Please add more keys in Settings, or wait for a key's limit to reset.";
+          } else {
+            failureReason = `Translation failed: ${e.message}`;
+          }
+        }
+
+        if (failureReason) setErrorMsg(failureReason);
+
+        setParsedSections(prev => prev.map(s => {
+          if (s.id !== pageId) return s;
+          if (translatedHtmlResult) {
+            return {
+              ...s,
+              translatedHtml: translatedHtmlResult,
+              originalTranslatedHtml: s.originalTranslatedHtml || translatedHtmlResult,
+              translationStatus: 'done',
+              translationError: null
+            };
+          }
+          return { ...s, translationStatus: 'error', translationError: failureReason };
+        }));
+      }
+
+      setProgress(Math.round(((i + 1) / totalPages) * 100));
+    }
+
+    setIsTranslatingAll(false);
+    setSuccessMsg("Batch translation complete!");
+  };
+
+  const handleVerifyPage = async (pageId) => {
+    const page = parsedSections.find(s => s.id === pageId);
+    if (!page || !page.translatedHtml) return;
+
+    setErrorMsg(null);
+    setSuccessMsg(null);
+
+    setParsedSections(prev => prev.map(s => (
+      s.id === pageId ? { ...s, translationStatus: 'verifying' } : s
+    )));
+
+    const finalHtml = await verifyAndCorrectTranslation(page.content.rawText, page.id, page.isPdf, page.translatedHtml);
+
+    setParsedSections(prev => prev.map(s => (
+      s.id === pageId
+        ? {
+            ...s,
+            translatedHtml: finalHtml,
+            originalTranslatedHtml: s.originalTranslatedHtml || finalHtml,
+            translationStatus: 'done'
+          }
+        : s
+    )));
+    setSuccessMsg(`Section ${pageId} verified successfully!`);
+  };
+
+  // PHASE 3: retry now also passes this page's structure, the previous
+  // page's structure (looked up by id-1 from current parsedSections, since a
+  // retry happens outside the batch loop), and the current glossary, then
+  // merges any new glossary suggestions the same way the batch loop does.
+  const handleRetryPage = async (pageId) => {
+    const page = parsedSections.find(s => s.id === pageId);
+    if (!page) return;
+    const prevPage = parsedSections.find(s => s.id === pageId - 1);
+
+    setErrorMsg(null);
+    setSuccessMsg(null);
+
+    setParsedSections(prev => prev.map(s => (
+      s.id === pageId ? { ...s, translationStatus: 'loading', translationError: null } : s
+    )));
+
+    let translatedHtmlResult = null;
+    let failureReason = null;
+    try {
+      const result = await translatePage(
+        page.content.rawText,
+        page.id,
+        page.isPdf,
+        page.structure || null,
+        prevPage?.structure || null,
+        glossaryRef.current
+      );
+      const validation = validateTranslationResult(result.html, page.content.rawText);
+      if (validation.valid) {
+        translatedHtmlResult = result.html;
+        const merged = mergeGlossaryEntries(glossaryRef.current, result.glossarySuggestions);
+        glossaryRef.current = merged;
+        setGlossary(merged);
+      } else {
+        failureReason = validation.reason;
+      }
+    } catch (e) {
+      console.error("Retry translation error:", e);
+      if (e.message === 'NO_API_KEY') {
+        failureReason = "Please enter at least one Mistral API key in Settings.";
+      } else if (e.message === 'ALL_KEYS_EXHAUSTED') {
+        failureReason = "All Mistral API keys have reached their limit or are invalid. Please add more keys in Settings, or wait for a key's limit to reset.";
+      } else {
+        failureReason = `Retry failed: ${e.message}`;
+      }
+    }
+
+    if (failureReason) setErrorMsg(failureReason);
+
+    setParsedSections(prev => prev.map(s => {
+      if (s.id !== pageId) return s;
+      if (translatedHtmlResult) {
+        return {
+          ...s,
+          previousTranslatedHtml: s.translatedHtml || s.previousTranslatedHtml,
+          translatedHtml: translatedHtmlResult,
+          originalTranslatedHtml: s.originalTranslatedHtml || translatedHtmlResult,
+          translationStatus: 'done',
+          translationError: null,
+          retryCount: (s.retryCount || 0) + 1
+        };
+      }
+      return { ...s, translationStatus: 'error', translationError: failureReason, retryCount: (s.retryCount || 0) + 1 };
+    }));
+
+    if (translatedHtmlResult) {
+      setSuccessMsg(`Section ${pageId} retried successfully!`);
+    }
+  };
+
+  const handleResetTranslation = (pageId) => {
+    setParsedSections(prev => prev.map(s => {
+      if (s.id === pageId && s.originalTranslatedHtml) {
+        return {
+          ...s,
+          previousTranslatedHtml: s.translatedHtml || s.previousTranslatedHtml,
+          translatedHtml: s.originalTranslatedHtml,
+          translationStatus: 'done'
+        };
+      }
+      return s;
+    }));
+    setSuccessMsg(`Section ${pageId} reset to its original translation.`);
+  };
+
+  const handleEditableContentBlur = (pageId, event) => {
+    const updatedHtml = event.target.innerHTML;
+    setParsedSections(prev => {
+      return prev.map(s => s.id === pageId ? { ...s, translatedHtml: updatedHtml } : s);
+    });
+  };
+
+  // PHASE 4: "Remove Image" - reverts a specific uploaded placeholder back to
+  // the original upload-prompt placeholder markup, without touching any other
+  // placeholder on this page or any other page's images (protected item #58).
+  const handleRemoveUploadedImage = useCallback((pageId, placeholderIndex) => {
+    setParsedSections(prev => prev.map(s => {
+      if (s.id !== pageId || !s.translatedHtml) return s;
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = s.translatedHtml;
+      const placeholders = Array.from(wrapper.querySelectorAll('.diagram-placeholder'));
+      const target = placeholders[placeholderIndex];
+      if (!target) return s;
+      target.style.border = '2px dashed #CBD5E1';
+      target.style.background = '';
+      target.style.padding = '20px';
+      target.innerHTML = '<p style="font-size: 14px; color: #64748B; margin-bottom: 8px;">Image Detected. Click to upload replacement.</p><input type="file" accept="image/*" class="diagram-upload-input" />';
+      return { ...s, translatedHtml: wrapper.innerHTML };
+    }));
+    setSuccessMsg('Image removed. You can upload a new one for this placeholder.');
+  }, []);
+
+  // PHASE 4: "Replace Image" - opens a fresh file picker for a specific
+  // already-filled placeholder and swaps only that image, preserving its
+  // position/identity (reuses the same detached-clone + diagramUploaded
+  // event flow as the original upload path - protected items #33-#36).
+  const handleReplaceUploadedImage = useCallback((pageId, placeholderIndex) => {
+    const tempInput = document.createElement('input');
+    tempInput.type = 'file';
+    tempInput.accept = 'image/*';
+    tempInput.style.display = 'none';
+    document.body.appendChild(tempInput);
+
+    tempInput.addEventListener('change', () => {
+      const file = tempInput.files[0];
+      document.body.removeChild(tempInput);
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const base64 = event.target.result;
+        setParsedSections(prev => prev.map(s => {
+          if (s.id !== pageId || !s.translatedHtml) return s;
+          const wrapper = document.createElement('div');
+          wrapper.innerHTML = s.translatedHtml;
+          const placeholders = Array.from(wrapper.querySelectorAll('.diagram-placeholder'));
+          const target = placeholders[placeholderIndex];
+          if (!target) return s;
+
+          const assetMeta = s.structure?.visualAssets?.[placeholderIndex] || null;
+          const hasKnownSize = assetMeta && assetMeta.width && assetMeta.height;
+          const imgStyle = hasKnownSize
+            ? `max-width: 100%; width: ${Math.min(assetMeta.width, 700)}px; height: auto; aspect-ratio: ${assetMeta.width} / ${assetMeta.height}; border-radius: 8px; display: block; margin: 0 auto; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);`
+            : `max-width: 100%; max-height: 400px; border-radius: 8px; display: block; margin: 0 auto; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);`;
+
+          target.innerHTML = `<img src="${base64}" data-phase4-asset-index="${placeholderIndex}" style="${imgStyle}" alt="Uploaded Diagram" />`;
+          target.style.border = 'none';
+          target.style.background = 'transparent';
+          target.style.padding = '0';
+          return { ...s, translatedHtml: wrapper.innerHTML };
+        }));
+        setSuccessMsg('Image replaced successfully.');
+      };
+      reader.readAsDataURL(file);
+    });
+
+    tempInput.click();
+  }, []);
+
+  // PHASE 4: after the editable content renders, inject "Replace"/"Remove"
+  // controls under each already-filled diagram placeholder for the active
+  // page only. This is purely a DOM-presentation pass on top of the existing
+  // rendered HTML - it never mutates parsedSections/translatedHtml itself, so the
+  // underlying translation content and export output are untouched.
+  useEffect(() => {
+    const container = editorContainerRef.current;
+    if (!container) return;
+    const editorDiv = container.querySelector('[id^="translation-editor-"]');
+    if (!editorDiv) return;
+
+    const placeholders = Array.from(editorDiv.querySelectorAll('.diagram-placeholder'));
+    placeholders.forEach((placeholder, idx) => {
+      const hasImage = !!placeholder.querySelector('img');
+      let controls = placeholder.parentElement && placeholder.parentElement.classList.contains('phase4-diagram-controls-wrapper')
+        ? placeholder.parentElement.querySelector('.phase4-diagram-controls')
+        : null;
+
+      if (!hasImage) {
+        // Not yet uploaded - no controls needed, native upload input handles it.
+        if (controls) controls.remove();
+        return;
+      }
+
+      if (!controls) {
+        controls = document.createElement('div');
+        controls.className = 'phase4-diagram-controls';
+        const replaceBtn = document.createElement('button');
+        replaceBtn.type = 'button';
+        replaceBtn.className = 'phase4-diagram-btn replace';
+        replaceBtn.textContent = 'Replace Image';
+        replaceBtn.onclick = (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          handleReplaceUploadedImage(activeSectionId, idx);
+        };
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'phase4-diagram-btn remove';
+        removeBtn.textContent = 'Remove Image';
+        removeBtn.onclick = (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          handleRemoveUploadedImage(activeSectionId, idx);
+        };
+        controls.appendChild(replaceBtn);
+        controls.appendChild(removeBtn);
+        placeholder.insertAdjacentElement('afterend', controls);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSectionId, parsedSections, reviewMode, handleReplaceUploadedImage, handleRemoveUploadedImage]);
+
+  const handleSaveSettings = () => {
+    const keys = apiKeys.map(k => k.trim());
+    if (!keys[0]) {
+      setErrorMsg("Please enter at least the first Mistral API key.");
+      return;
+    }
+
+    // Validate every non-empty key is 25-40 characters (Mistral key format).
+    for (let i = 0; i < keys.length; i++) {
+      if (keys[i] && (keys[i].length < MIN_MISTRAL_KEY_LENGTH || keys[i].length > MAX_MISTRAL_KEY_LENGTH)) {
+        setErrorMsg(`API Key ${i + 1} looks invalid - Mistral API keys are ${MIN_MISTRAL_KEY_LENGTH}-${MAX_MISTRAL_KEY_LENGTH} characters long (got ${keys[i].length}).`);
+        return;
+      }
+    }
+
+    sessionStorage.setItem('translator_api_keys', JSON.stringify(keys));
+
+    if (rememberApiKey) {
+      localStorage.setItem('translator_api_keys', JSON.stringify(keys));
+    } else {
+      localStorage.removeItem('translator_api_keys');
+    }
+
+    setApiKeys(keys);
+    rotationRef.current = { keyIdx: 0, deadKeys: new Set() };
+    setShowSettings(false);
+    setSuccessMsg("Settings saved successfully.");
+  };
+
+  // PHASE 5: performExport contains the actual export-generation logic
+  // (hardened per Phase 5 requirements). It is only reached after validation
+  // (see exportHtml below) has either found no warnings, or the user chose
+  // to proceed anyway from the warnings modal.
+  const performExport = async () => {
+    if (isExporting) return;
+    setIsExporting(true);
+    setErrorMsg(null);
+
+    const finishedTranslations = parsedSections.filter(s => s.translationStatus === 'done' && s.translatedHtml && s.translatedHtml.trim());
+    if (finishedTranslations.length === 0) {
+      setErrorMsg("No translated pages found. Please process at least one section first.");
+      setIsExporting(false);
+      return;
+    }
+
+    try {
+      // PHASE 5: export template hardened - explicit Kalpurush (Bangla) +
+      // Scheherazade/Noto Naskh Arabic (for local dir="rtl" spans, item #64/
+      // Phase 3 consistency) fonts, controlled ~850px width, per-page aspect
+      // ratio, print break-after-per-section, and non-overlapping section
+      // markers/separation, while preserving the existing section/marker
+      // architecture (protected items #46-#51).
+      const exportFontFamily = targetLang === 'bn' ? "'Kalpurush', sans-serif" : "'Times New Roman', Times, serif";
+      const exportFontLink = targetLang === 'bn'
+        ? '<link href="https://fonts.maateen.me/kalpurush/font.css" rel="stylesheet">'
+        : '';
+      let htmlContent = `
+        <!DOCTYPE html>
+        <html lang="${targetLang}">
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Mirrored Translation - ${fileData?.name || 'Document'}</title>
+          ${exportFontLink}
+          <link href="https://fonts.googleapis.com/css2?family=Scheherazade+New:wght@400;600;700&display=swap" rel="stylesheet">
+          <link href="https://fonts.googleapis.com/css2?family=Noto+Naskh+Arabic:wght@400;600;700&display=swap" rel="stylesheet">
+          <style>
+            /* PHASE 5: target-language font applies by default, but is overridden
+               for any explicitly marked local RTL span (Phase 3 embedded-quotation
+               convention) so it renders in its own Arabic/Urdu typeface rather
+               than being forced into the target font - no global RTL/LTR string
+               hack, this is a scoped CSS rule keyed off the same dir="rtl" marker
+               the prompt already asks the model to emit. */
+            body, .translated-section, .translated-section * {
+              font-family: ${exportFontFamily};
+            }
+            .translated-section [dir="rtl"] {
+              font-family: 'Scheherazade New', 'Noto Naskh Arabic', serif !important;
+            }
+            body {
+              background-color: #f8fafc;
+              color: #0f172a;
+              line-height: 1.8;
+              padding: 2.5rem 1rem;
+              margin: 0;
+            }
+            /* PHASE 5: each PDF page becomes its own centered, width-controlled
+               "page container" with its own layout context - no overlap between
+               page 1 and page 2 content, source aspect ratio respected where
+               known, without forcing a fixed height that would clip overflow. */
+            .page-container {
+              max-width: 850px;
+              margin: 0 auto 2.5rem auto;
+              background: #ffffff;
+              border: 1px solid #e2e8f0;
+              border-radius: 12px;
+              box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.08);
+              padding: 2.25rem 2rem;
+              box-sizing: border-box;
+              overflow: visible;
+              break-inside: avoid;
+              page-break-inside: avoid;
+            }
+            .page-container-inner {
+              direction: ltr;
+            }
+            .section-marker-wrap {
+              max-width: 850px;
+              margin: 0 auto 2.5rem auto;
+              display: flex;
+              align-items: center;
+              gap: 12px;
+            }
+            .section-marker-wrap .line {
+              flex: 1;
+              border-bottom: 2px dashed #cbd5e1;
+            }
+            .section-marker {
+              color: #94a3b8;
+              font-size: 12px;
+              font-weight: bold;
+              font-family: 'Plus Jakarta Sans', sans-serif;
+              white-space: nowrap;
+            }
+            @media print {
+              body { background: white; padding: 0; }
+              .page-container {
+                border: none;
+                box-shadow: none;
+                border-radius: 0;
+                margin: 0 auto;
+                break-after: page;
+                page-break-after: always;
+              }
+              .section-marker-wrap { display: none; }
+            }
+          </style>
+        </head>
+        <body>
+      `;
+
+      parsedSections.forEach((s) => {
+        if (s.translationStatus !== 'done' || !s.translatedHtml || !s.translatedHtml.trim()) return;
+        // PHASE 5: per-page aspect ratio (Phase 2 geometry) applied as a CSS
+        // hint via min-height so the exported container roughly mirrors the
+        // source page's proportions without clipping longer content.
+        const aspectRatio = s.structure?.pageGeometry?.aspectRatio;
+        const minHeightStyle = aspectRatio ? `min-height: calc(min(786px, 100vw - 4rem) / ${aspectRatio});` : '';
+        htmlContent += `
+          <div class="page-container" id="section-${s.id}" style="${minHeightStyle}">
+            <div class="page-container-inner translated-section">
+              ${sanitizeHtml(s.translatedHtml)}
+            </div>
+          </div>
+          <div class="section-marker-wrap">
+            <span class="line"></span>
+            <span class="section-marker">SECTION ${s.id}</span>
+            <span class="line"></span>
+          </div>
+        `;
+      });
+
+      htmlContent += `
+        </body>
+        </html>
+      `;
+
+      const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Translated_${targetLang === 'bn' ? 'Bangla' : 'English'}_${(fileData?.name || 'Document').split('.')[0]}.html`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      setSuccessMsg("Document exported to HTML format successfully!");
+    } catch (e) {
+      setErrorMsg("Export failed. An error occurred while generating HTML.");
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  // PHASE 5: exportHtml is now the entry point wired to the Export button. It
+  // runs non-destructive structural validation first; if issues are found it
+  // opens a warnings modal so the user can see them and decide whether to fix
+  // pages first or export anyway, instead of silently exporting or silently
+  // dropping questionable content.
+  const exportHtml = () => {
+    if (isExporting) return;
+    const warnings = validateExportStructure(parsedSections);
+    if (warnings.length > 0) {
+      setExportWarnings(warnings);
+      setShowExportWarningsModal(true);
+      return;
+    }
+    performExport();
+  };
+
+  const handleCopyText = async (text, id) => {
+    const tempEl = document.createElement('div');
+    tempEl.innerHTML = text;
+    const plainText = tempEl.innerText || tempEl.textContent || '';
+
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(plainText);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = plainText;
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+      }
+      setCopiedId(id);
+      setTimeout(() => setCopiedId(null), 2000);
+    } catch (err) {
+      console.error('Failed to copy text', err);
+      setErrorMsg("Couldn't copy to clipboard. Please try selecting the text manually.");
+    }
+  };
+
+  const targetLabel = TARGET_LABELS[targetLang];
+  const activePage = parsedSections.find(s => s.id === activeSectionId);
+  const activeDiagnostics = activePage ? computeDiagnostics(activePage) : null; // PHASE 4
+  const activeAspectRatio = activePage?.structure?.pageGeometry?.aspectRatio || null; // PHASE 4
+  const activeSourceImage = activeSectionId ? sourcePageImages[activeSectionId] : null; // PHASE 4
+
+  return (
+    <div className="h-screen flex flex-col bg-slate-50 text-slate-900 font-sans selection:bg-indigo-100 selection:text-indigo-950">
+
+      <nav className="relative z-40 bg-white border-b border-slate-200/80 px-6 py-3 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white shadow-md shadow-indigo-100">
+            <BookOpen size={20} />
+          </div>
+          <div>
+            <h1 className="text-base font-extrabold text-slate-800 tracking-tight leading-none mb-1">
+              Ar/En/Ur to Bangla/English Translator
+            </h1>
+            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1">
+              <Globe size={10} className="text-indigo-500" /> MULTILINGUAL MIRROR LAYOUT STUDIO (MINISTRAL 3 14B)
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200">
+            <button
+              onClick={() => setTargetLang('bn')}
+              className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${targetLang === 'bn' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-500 hover:text-slate-800'}`}
+              title="Translate to Bangla (Arabic, Urdu, or English source)"
+            >
+              → Bangla
+            </button>
+            <button
+              onClick={() => setTargetLang('en')}
+              className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${targetLang === 'en' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-500 hover:text-slate-800'}`}
+              title="Translate to English (Arabic or Urdu source only)"
+            >
+              → English
+            </button>
+          </div>
+
+          <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200">
+            <button
+              onClick={() => setSourceLangMode('auto')}
+              className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${sourceLangMode === 'auto' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-500 hover:text-slate-800'}`}
+              title="Auto Detect Language"
+            >
+              Auto
+            </button>
+            <button
+              onClick={() => setSourceLangMode('ar_ur')}
+              className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${sourceLangMode === 'ar_ur' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-500 hover:text-slate-800'}`}
+              title="Arabic & Urdu Mode (RTL)"
+            >
+              العربية / اردو
+            </button>
+            {targetLang === 'bn' && (
+              <button
+                onClick={() => setSourceLangMode('en')}
+                className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${sourceLangMode === 'en' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-500 hover:text-slate-800'}`}
+                title="English Mode (LTR)"
+              >
+                English
+              </button>
+            )}
+          </div>
+
+          {parsedSections.length > 0 && (
+            <>
+              <button
+                onClick={startSequentialAnalysis}
+                disabled={isTranslatingAll}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-xl text-xs font-bold flex items-center gap-2 disabled:opacity-50 transition-all shadow-sm shadow-indigo-200 cursor-pointer"
+              >
+                {isTranslatingAll ? (
+                  <>
+                    <Loader2 size={14} className="animate-spin" />
+                    <span>Analyzing ({progress}%)</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles size={14} />
+                    <span>Translate Entire Document</span>
+                  </>
+                )}
+              </button>
+              <button
+                onClick={exportHtml}
+                disabled={isExporting}
+                className="px-4 py-2 bg-slate-900 hover:bg-slate-950 text-white rounded-xl text-xs font-bold flex items-center gap-2 disabled:opacity-50 transition-all shadow-sm cursor-pointer"
+              >
+                {isExporting ? <Loader2 size={14} className="animate-spin" /> : <FileDown size={14} />}
+                <span>Export HTML</span>
+              </button>
+            </>
+          )}
+
+          <button
+            onClick={() => setShowSettings(true)}
+            className="p-2 rounded-xl text-slate-500 hover:bg-slate-100 transition-all cursor-pointer"
+            title="Settings"
+          >
+            <Settings size={18} />
+          </button>
+
+          <button
+            onClick={() => setShowHelpModal(true)}
+            className="p-2 rounded-xl text-slate-500 hover:bg-slate-100 transition-all cursor-pointer"
+            title="Workflow Guide"
+          >
+            <HelpCircle size={18} />
+          </button>
+        </div>
+      </nav>
+
+      {showSettings && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100">
+            <div className="flex justify-between items-center mb-4 border-b border-slate-100 pb-3">
+              <h3 className="text-base font-bold text-slate-800 flex items-center gap-2">
+                <Settings size={18} className="text-indigo-600" /> Application Settings
+              </h3>
+              <button onClick={() => setShowSettings(false)} className="p-1 hover:bg-slate-100 rounded-lg text-slate-400 hover:text-slate-600 cursor-pointer">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-4 text-xs text-slate-600">
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">Mistral API Keys ({MISTRAL_MODEL})</label>
+                <p className="text-[10px] text-slate-400 mb-2">
+                  Key 1 is required. Keys 2-5 are optional and rotate in automatically once the earlier key hits its usage limit. Rotation cycles 1 → 2 → 3 → 4 → 5 → back to 1, forever. Minimum {REQUEST_INTERVAL_MS / 1000}s between every request.
+                </p>
+                <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                  {apiKeys.map((k, idx) => (
+                    <div key={idx}>
+                      <label className="block text-[10px] font-bold text-slate-500 mb-1">
+                        API Key {idx + 1} {idx === 0 ? '(Required)' : '(Optional)'}
+                      </label>
+                      <input
+                        type="password"
+                        value={k}
+                        onChange={(e) => {
+                          const next = [...apiKeys];
+                          next[idx] = e.target.value;
+                          setApiKeys(next);
+                        }}
+                        minLength={MIN_MISTRAL_KEY_LENGTH}
+                        maxLength={MAX_MISTRAL_KEY_LENGTH}
+                        placeholder={idx === 0 ? `Enter your Mistral API key (${MIN_MISTRAL_KEY_LENGTH}-${MAX_MISTRAL_KEY_LENGTH} chars)` : `Enter Mistral API key (optional, ${MIN_MISTRAL_KEY_LENGTH}-${MAX_MISTRAL_KEY_LENGTH} chars)`}
+                        className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-200 focus:border-indigo-500 outline-none"
+                      />
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[10px] text-slate-400 mt-2">By default your keys are kept only for this browser tab/session and are cleared when you close it.</p>
+                <label className="flex items-center gap-2 mt-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={rememberApiKey}
+                    onChange={(e) => setRememberApiKey(e.target.checked)}
+                    className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-200 cursor-pointer"
+                  />
+                  <span className="text-[10px] text-slate-500">Remember these keys on this device (stores them in Local Storage across sessions)</span>
+                </label>
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">Target Language</label>
+                <select
+                  value={targetLang}
+                  onChange={(e) => setTargetLang(e.target.value)}
+                  className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-200 focus:border-indigo-500 outline-none"
+                >
+                  <option value="bn">Bangla (from Arabic, Urdu, or English)</option>
+                  <option value="en">English (from Arabic or Urdu only)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">Source Language Preset</label>
+                <select
+                  value={sourceLangMode}
+                  onChange={(e) => setSourceLangMode(e.target.value)}
+                  className="w-full px-3 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-200 focus:border-indigo-500 outline-none"
+                >
+                  <option value="auto">Auto Detect Direction & Script</option>
+                  <option value="ar_ur">Arabic / Urdu Mode (RTL Layout)</option>
+                  {targetLang === 'bn' && <option value="en">English Mode (LTR Layout)</option>}
+                </select>
+              </div>
+            </div>
+
+            <div className="mt-6 pt-3 border-t border-slate-100 flex justify-end">
+              <button
+                onClick={handleSaveSettings}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl cursor-pointer"
+              >
+                Save & Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showHelpModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
+          <div className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl border border-slate-100">
+            <div className="flex justify-between items-center mb-4 border-b border-slate-100 pb-3">
+              <h3 className="text-base font-bold text-slate-800 flex items-center gap-2">
+                <Sparkles size={18} className="text-indigo-600" /> Multilingual Translation Guide
+              </h3>
+              <button onClick={() => setShowHelpModal(false)} className="p-1 hover:bg-slate-100 rounded-lg text-slate-400 hover:text-slate-600 cursor-pointer">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-4 text-xs text-slate-600 leading-relaxed">
+              <p>This studio translates documents from <strong>Arabic, Urdu, or English</strong> into <strong>Bangla</strong> (all three sources) or <strong>English</strong> (Arabic/Urdu sources only), while preserving the original page's visual layout - one page, one API call to Ministral 3 14B.</p>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/60">
+                  <span className="font-bold text-indigo-600 text-[10px] uppercase block mb-1">1. Upload</span>
+                  Upload a PDF and click <strong>"Translate Entire Document"</strong>. Pages are processed one at a time.
+                </div>
+                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/60">
+                  <span className="font-bold text-emerald-600 text-[10px] uppercase block mb-1">2. Review</span>
+                  Each page's 100% Mirrored Layout appears as soon as it finishes. Click directly into the text to make small manual edits any time. Use <strong>Compare</strong> or <strong>Overlay</strong> mode to check alignment against the original page.
+                </div>
+                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/60">
+                  <span className="font-bold text-amber-600 text-[10px] uppercase block mb-1">3. Re-translate</span>
+                  Not happy with a page? Click <strong>"Re-translate"</strong> on the left sidebar for that page to generate a fresh translation. If a page fails, use <strong>"Retry"</strong> to try just that page again.
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-6 pt-3 border-t border-slate-100 flex justify-end">
+              <button
+                onClick={() => setShowHelpModal(false)}
+                className="px-4 py-2 bg-slate-900 hover:bg-slate-950 text-white text-xs font-bold rounded-xl cursor-pointer"
+              >
+                Got it, let's start!
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PHASE 5: pre-export structural warnings modal - non-destructive, lets
+          the user see detected issues (missing/duplicate/malformed/empty
+          sections) and decide whether to export anyway or go fix pages first. */}
+      {showExportWarningsModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
+          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-100">
+            <div className="flex justify-between items-center mb-4 border-b border-slate-100 pb-3">
+              <h3 className="text-base font-bold text-slate-800 flex items-center gap-2">
+                <AlertTriangle size={18} className="text-amber-500" /> Pre-Export Warnings
+              </h3>
+              <button onClick={() => setShowExportWarningsModal(false)} className="p-1 hover:bg-slate-100 rounded-lg text-slate-400 hover:text-slate-600 cursor-pointer">
+                <X size={18} />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-500 mb-3">The following issues were detected before export. Nothing has been changed or deleted - you can export anyway, or close this and fix the pages listed below first.</p>
+
+            <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1 mb-4">
+              {exportWarnings.map((w, i) => (
+                <div key={i} className="flex items-start gap-2 text-xs bg-amber-50 border border-amber-100 text-amber-800 rounded-lg px-3 py-2">
+                  <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                  <span>{w.message}</span>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
+              <button
+                onClick={() => setShowExportWarningsModal(false)}
+                className="px-4 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 text-xs font-bold rounded-xl cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  setShowExportWarningsModal(false);
+                  performExport();
+                }}
+                className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xl cursor-pointer"
+              >
+                Export Anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <main className="flex-1 flex flex-col md:flex-row overflow-hidden">
+
+        {isParsing ? (
+          <div className="flex-1 flex flex-col items-center justify-center space-y-4 max-w-4xl mx-auto w-full p-6 text-center animate-in fade-in duration-500">
+            <Loader2 size={48} className="animate-spin text-indigo-600" />
+            <div>
+              <h3 className="text-xl font-bold text-slate-800">Reading Document...</h3>
+              <p className="text-sm text-slate-500 mt-2">Extracting structure and text layer. This might take a moment for large files.</p>
+            </div>
+            {parseProgress > 0 && (
+              <div className="w-64 mt-4 space-y-2">
+                <div className="h-2 bg-slate-200 rounded-full overflow-hidden">
+                  <div className="h-full bg-indigo-600 transition-all duration-300" style={{ width: `${parseProgress}%` }}></div>
+                </div>
+                <p className="text-xs font-bold text-slate-500">{parseProgress}% Complete</p>
+              </div>
+            )}
+          </div>
+        ) : !fileData ? (
+          <div className="flex-1 max-w-4xl mx-auto w-full p-6 md:p-12 flex flex-col justify-center">
+            <div className="text-center mb-8 max-w-2xl mx-auto">
+              <span className="bg-indigo-50 text-indigo-700 px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest mb-4 inline-block border border-indigo-100">
+                Arabic • Urdu • English → Bangla / English Mirror Studio
+              </span>
+              <h2 className="text-3xl md:text-5xl font-black text-slate-900 tracking-tight mb-4 leading-tight">
+                Preserve Original Layouts. <br/>
+                <span className="text-indigo-600">Translate to {targetLabel}.</span>
+              </h2>
+              <p className="text-slate-500 text-sm md:text-base leading-relaxed">
+                Upload Arabic, Urdu, or English PDF books. Reconstruct visual layouts, solve page-junction text splits, and generate publication-ready {targetLabel} translations (exported as HTML), powered by Ministral 3 14B.
+              </p>
+            </div>
+
+            <label className="group block w-full max-w-xl mx-auto aspect-video border-3 border-dashed border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/10 rounded-2xl bg-white transition-all cursor-pointer relative overflow-hidden shadow-xs">
+              <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center">
+                <div className="w-14 h-14 bg-slate-50 group-hover:bg-indigo-50 rounded-2xl flex items-center justify-center mb-4 transition-all">
+                  <Upload size={24} className="text-slate-400 group-hover:text-indigo-600" />
+                </div>
+                <div className="space-y-2">
+                  <span className="bg-slate-900 text-white px-6 py-2.5 rounded-xl font-bold text-xs block shadow-md shadow-slate-200 group-hover:bg-indigo-600 transition-colors">
+                    Browse PDF File
+                  </span>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Supports .pdf documents</p>
+                </div>
+              </div>
+              <input type="file" accept=".pdf" className="hidden" onChange={handleFileUpload} />
+            </label>
+          </div>
+        ) : (
+          <div className="flex-1 flex flex-col md:flex-row overflow-hidden w-full">
+
+            <aside className="w-full md:w-72 bg-white border-b md:border-b-0 md:border-r border-slate-200/80 flex flex-col h-full shrink-0">
+
+              <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+                <div className="flex items-center gap-3 overflow-hidden">
+                  <div className="w-8 h-8 bg-indigo-50 text-indigo-600 rounded-lg flex items-center justify-center shrink-0">
+                    <FileText size={16} />
+                  </div>
+                  <div className="overflow-hidden">
+                    <h4 className="text-xs font-bold text-slate-800 truncate" title={fileData.name}>{fileData.name}</h4>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">{parsedSections.length} Sections • {fileData.size} MB</p>
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => {
+                    try { localStorage.removeItem(SESSION_STORAGE_KEY); } catch (e) { /* ignore */ }
+                    window.location.reload();
+                  }}
+                  className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all cursor-pointer"
+                  title="Close Document (clears saved session)"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+
+              <div className="px-4 py-2 bg-slate-100/50 text-slate-500 text-[10px] font-black uppercase tracking-wider border-b border-slate-100">
+                Document Navigation
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-2 space-y-1">
+                {parsedSections.map((s) => {
+                  const isActive = activeSectionId === s.id;
+                  let statusBg = "bg-slate-100 text-slate-500";
+                  if (isActive) statusBg = "bg-indigo-600 text-white shadow-xs";
+
+                  return (
+                    <div
+                      key={s.id}
+                      className={`w-full text-left px-3 py-2.5 rounded-xl flex flex-col transition-all ${isActive ? 'bg-indigo-50/80 border border-indigo-100/50 shadow-xs' : 'hover:bg-slate-50 border border-transparent'}`}
+                    >
+                      <div
+                        onClick={() => setActiveSectionId(s.id)}
+                        className="flex items-center justify-between cursor-pointer"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          <span className={`w-7 h-7 flex items-center justify-center rounded-lg font-black text-xs shrink-0 ${statusBg}`}>
+                            {s.id}
+                          </span>
+                          <div className="min-w-0">
+                            <span className={`text-xs block truncate ${isActive ? 'text-indigo-950 font-bold' : 'text-slate-700 font-semibold'}`}>
+                              {s.meta.partName}
+                            </span>
+                            <span className="text-[9px] text-slate-400 block leading-tight font-semibold">
+                              {s.translationStatus === 'idle' ? 'Not Processed' : s.translationStatus === 'loading' ? 'Translating...' : s.translationStatus === 'verifying' ? 'Verifying...' : s.translationStatus === 'error' ? 'Failed' : 'Translated'}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1.5">
+                          {s.translationStatus === 'done' && (
+                            <span className="w-2 h-2 rounded-full bg-emerald-500" title="Translated" />
+                          )}
+                          {(s.translationStatus === 'loading' || s.translationStatus === 'verifying') && (
+                            <Loader2 size={12} className="animate-spin text-indigo-500" />
+                          )}
+                          {s.translationStatus === 'error' && (
+                            <span className="w-2 h-2 rounded-full bg-red-500" title="Failed" />
+                          )}
+                          <ChevronRight size={14} className={isActive ? 'text-indigo-400' : 'text-slate-300'} />
+                        </div>
+                      </div>
+
+                      {s.translationStatus === 'error' && (
+                        <div className="mt-2 pl-10 pr-1">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActiveSectionId(s.id);
+                              handleRetryPage(s.id);
+                            }}
+                            title="Retry this page only (Ministral 3 14B)"
+                            className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg bg-red-50 border border-red-200 text-red-600 hover:bg-red-100 transition-all cursor-pointer text-[10px] font-bold"
+                          >
+                            <RotateCcw size={11} />
+                            <span>Retry Page {s.id}</span>
+                          </button>
+                        </div>
+                      )}
+
+                      {s.translationStatus !== 'idle' && s.translationStatus !== 'error' && (
+                        <div className="mt-2.5 pl-10 pr-1 flex items-center gap-1.5">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActiveSectionId(s.id);
+                              handleVerifyPage(s.id);
+                            }}
+                            disabled={s.translationStatus === 'loading' || s.translationStatus === 'verifying' || !s.translatedHtml}
+                            title={`Verify & auto-correct (Ministral 3 14B, 1 API request, ${REQUEST_INTERVAL_MS / 1000}s gap)`}
+                            className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-400 hover:text-indigo-600 hover:border-indigo-300 hover:bg-indigo-50 transition-all cursor-pointer disabled:opacity-50 shrink-0"
+                          >
+                            {s.translationStatus === 'verifying' ? (
+                              <Loader2 size={12} className="animate-spin" />
+                            ) : (
+                              <ShieldCheck size={12} />
+                            )}
+                          </button>
+
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleResetTranslation(s.id);
+                            }}
+                            disabled={s.translationStatus === 'loading' || s.translationStatus === 'verifying' || !s.originalTranslatedHtml}
+                            title="Reset to Original Translation (no API request)"
+                            className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-400 hover:text-purple-600 hover:border-purple-300 hover:bg-purple-50 transition-all cursor-pointer disabled:opacity-50 shrink-0"
+                          >
+                            <Sparkles size={12} />
+                          </button>
+
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActiveSectionId(s.id);
+                              handleRetryPage(s.id);
+                            }}
+                            disabled={s.translationStatus === 'loading' || s.translationStatus === 'verifying'}
+                            title="Retry / retranslate this page (previous result is preserved)"
+                            className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-400 hover:text-amber-600 hover:border-amber-300 hover:bg-amber-50 transition-all cursor-pointer disabled:opacity-50 shrink-0"
+                          >
+                            <RotateCcw size={12} />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </aside>
+
+            <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
+
+              <div className="bg-white border-b border-slate-200/80 px-6 py-2.5 flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold text-slate-500">Workspace:</span>
+                  <span className="text-xs font-extrabold text-indigo-700 bg-indigo-50 border border-indigo-100 px-2.5 py-1 rounded-md">
+                    Section {activeSectionId} Workspace
+                  </span>
+                </div>
+
+                {/* PHASE 4: Target / Compare / Overlay mode switcher - additive, defaults to Target */}
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200">
+                    <button
+                      onClick={() => setReviewMode('target')}
+                      className={`px-2.5 py-1 text-[10px] font-bold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${reviewMode === 'target' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-500 hover:text-slate-800'}`}
+                    >
+                      <Eye size={11} /> Target
+                    </button>
+                    <button
+                      onClick={() => setReviewMode('compare')}
+                      className={`px-2.5 py-1 text-[10px] font-bold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${reviewMode === 'compare' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-500 hover:text-slate-800'}`}
+                    >
+                      <Columns size={11} /> Compare
+                    </button>
+                    <button
+                      onClick={() => setReviewMode('overlay')}
+                      className={`px-2.5 py-1 text-[10px] font-bold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${reviewMode === 'overlay' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-500 hover:text-slate-800'}`}
+                    >
+                      <Layers size={11} /> Overlay
+                    </button>
+                  </div>
+
+                  {reviewMode === 'overlay' && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-[9px] font-bold text-slate-400 uppercase">Opacity</span>
+                      <input
+                        type="range"
+                        min="0.1"
+                        max="0.95"
+                        step="0.05"
+                        value={overlayOpacity}
+                        onChange={(e) => setOverlayOpacity(Number(e.target.value))}
+                        className="w-24 cursor-pointer"
+                      />
+                    </div>
+                  )}
+
+                  {/* PHASE 4: diagnostics toggle */}
+                  <button
+                    onClick={() => setDiagnosticsOpenFor(prev => ({ ...prev, [activeSectionId]: !prev[activeSectionId] }))}
+                    className={`px-2.5 py-1.5 text-[10px] font-bold rounded-lg border transition-all cursor-pointer flex items-center gap-1 ${diagnosticsOpenFor[activeSectionId] ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}
+                    title="Page quality diagnostics"
+                  >
+                    <Info size={11} /> Diagnostics
+                    {activeDiagnostics && activeDiagnostics.warnings.length > 0 && (
+                      <span className="ml-1 px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[9px]">{activeDiagnostics.warnings.length}</span>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* PHASE 4: non-blocking diagnostics panel */}
+              {diagnosticsOpenFor[activeSectionId] && activeDiagnostics && (
+                <div className="bg-white border-b border-slate-200/80 px-6 py-3 text-xs">
+                  <div className="flex flex-wrap gap-4 mb-2">
+                    <span className="text-slate-500"><strong className="text-slate-800">{activeDiagnostics.sourceBlockCount}</strong> source blocks</span>
+                    <span className="text-slate-500"><strong className="text-slate-800">{activeDiagnostics.translatedBlockCount}</strong> translated blocks</span>
+                    <span className="text-slate-500"><strong className="text-slate-800">{activeDiagnostics.visualAssetCount}</strong> visual assets detected</span>
+                    <span className="text-slate-500"><strong className="text-slate-800">{activeDiagnostics.placeholderCount}</strong> placeholders in output</span>
+                    <span className="text-slate-500">Verification: <strong className="text-slate-800">{activeDiagnostics.verificationStatus}</strong></span>
+                  </div>
+                  {activeDiagnostics.warnings.length === 0 ? (
+                    <div className="flex items-center gap-1.5 text-emerald-700">
+                      <CheckCircle2 size={12} /> No warnings detected for this page.
+                    </div>
+                  ) : (
+                    <div className="space-y-1">
+                      {activeDiagnostics.warnings.map((w, i) => (
+                        <div key={i} className="flex items-center gap-1.5 text-amber-700">
+                          <AlertTriangle size={12} className="shrink-0" /> <span>{w.message}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="flex-1 flex flex-col overflow-hidden p-6 gap-6 phase4-workspace-bg">
+
+                {(() => {
+                  if (!activePage) return null;
+
+                  const isTargetRenderable = activePage.translationStatus === 'done';
+
+                  // Shared "target page" content renderer used by Target and Compare modes,
+                  // and (with opacity) by Overlay mode.
+                  const renderTargetPage = (opts = {}) => (
+                    <div
+                      className="phase4-page-shell"
+                      style={{
+                        aspectRatio: activeAspectRatio ? `${activeAspectRatio}` : undefined,
+                        opacity: opts.opacity !== undefined ? opts.opacity : 1
+                      }}
+                    >
+                      <div ref={opts.isPrimary ? editorContainerRef : null} className="phase4-page-inner h-full overflow-y-auto">
+                        {isTargetRenderable ? (
+                          <div
+                            id={`translation-editor-${activeSectionId}`}
+                            contentEditable={!!opts.editable}
+                            suppressContentEditableWarning={true}
+                            onBlur={opts.editable ? (e) => handleEditableContentBlur(activeSectionId, e) : undefined}
+                            className={`mirror-flow ${targetLang === 'bn' ? 'bangla-font' : 'translated-text-font'} text-lg text-slate-800 text-left outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-100 rounded-xl select-text animate-in fade-in duration-300`}
+                            style={{ direction: 'ltr', border: 'none', padding: 0 }}
+                            dangerouslySetInnerHTML={{ __html: sanitizeHtml(activePage.translatedHtml) }}
+                          />
+                        ) : (
+                          <div className="h-full flex items-center justify-center text-center text-slate-400 text-xs p-6">
+                            No translated content yet for this page.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+
+                  const renderSourcePage = () => (
+                    <div
+                      className="phase4-page-shell"
+                      style={{ aspectRatio: activeAspectRatio ? `${activeAspectRatio}` : undefined }}
+                    >
+                      <div className="h-full w-full flex items-center justify-center overflow-hidden rounded-lg">
+                        {activeSourceImage ? (
+                          <img
+                            src={`data:image/jpeg;base64,${activeSourceImage}`}
+                            alt={`Original page ${activeSectionId}`}
+                            className="w-full h-full object-contain"
+                          />
+                        ) : (
+                          <div className="flex flex-col items-center gap-2 text-slate-400 text-xs p-6">
+                            {loadingSourceImage ? <Loader2 size={20} className="animate-spin" /> : <ImageOff size={20} />}
+                            <span>{loadingSourceImage ? 'Rendering original page…' : 'Original page image unavailable'}</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+
+                  return (
+                    <div className="flex-1 flex flex-col bg-white/40 rounded-xl overflow-hidden">
+                      <div className="px-5 py-3 border-b border-slate-200/60 flex items-center justify-between bg-white/70">
+                        <span className="text-xs font-extrabold uppercase tracking-wider text-slate-600 flex items-center gap-1.5">
+                          <Globe size={14} className="text-indigo-500" />
+                          {reviewMode === 'target' && `100% Mirrored Target Layout (${targetLabel})`}
+                          {reviewMode === 'compare' && `Compare: Original vs ${targetLabel} Translation`}
+                          {reviewMode === 'overlay' && `Overlay: Original underneath, ${targetLabel} above`}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          {activePage?.translationStatus === 'done' && reviewMode === 'target' && (
+                            <>
+                              <span className="text-[9px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-100 px-2 py-0.5 rounded-md flex items-center gap-1">
+                                <CheckCircle2 size={10} /> Translated
+                              </span>
+                              <button
+                                onClick={() => handleCopyText(activePage.translatedHtml, `bangla-${activeSectionId}`)}
+                                className="p-1 hover:bg-slate-100 rounded text-slate-400 hover:text-slate-600 transition-all cursor-pointer"
+                                title={`Copy ${targetLabel} Text`}
+                              >
+                                {copiedId === `bangla-${activeSectionId}` ? <Check size={14} className="text-emerald-600" /> : <Copy size={14} />}
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex-1 overflow-y-auto p-6 md:p-10">
+                        {activePage.translationStatus === 'idle' && reviewMode === 'target' && (
+                          <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-3">
+                            <div className="w-10 h-10 bg-slate-50 text-slate-400 rounded-full flex items-center justify-center">
+                              <Globe size={18} />
+                            </div>
+                            <div className="max-w-xs space-y-1">
+                              <h4 className="text-xs font-bold text-slate-800">Not Yet Translated</h4>
+                              <p className="text-[11px] text-slate-400">Click <strong>"Translate Entire Document"</strong> to generate the {targetLabel} mirrored translation for this page.</p>
+                            </div>
+                          </div>
+                        )}
+
+                        {activePage.translationStatus === 'loading' && reviewMode === 'target' && (
+                          <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-3">
+                            <div className="w-8 h-8 border-3 border-indigo-100 rounded-full animate-spin border-t-indigo-600"></div>
+                            <div className="space-y-1">
+                              <p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Translating to {targetLabel}...</p>
+                              <p className="text-[10px] text-slate-400">Mirroring document structure, style, and terminology</p>
+                            </div>
+                          </div>
+                        )}
+
+                        {activePage.translationStatus === 'verifying' && reviewMode === 'target' && (
+                          <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-3">
+                            <div className="w-8 h-8 border-3 border-indigo-100 rounded-full animate-spin border-t-indigo-600"></div>
+                            <div className="space-y-1">
+                              <p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Verifying & Correcting...</p>
+                              <p className="text-[10px] text-slate-400">Auditing the translation against the original source</p>
+                            </div>
+                          </div>
+                        )}
+
+                        {activePage.translationStatus === 'error' && reviewMode === 'target' && (
+                          <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-2">
+                            <AlertCircle size={28} className="text-red-500" />
+                            <div className="max-w-xs space-y-1">
+                              <h4 className="text-xs font-bold text-slate-800">Translation Failed</h4>
+                              <p className="text-[11px] text-slate-400">
+                                {activePage.translationError || `Error translating content to ${targetLabel}. Please retry.`}
+                              </p>
+                            </div>
+                            <button
+                              onClick={() => handleRetryPage(activePage.id)}
+                              className="mt-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold flex items-center gap-2 transition-all shadow-sm cursor-pointer"
+                            >
+                              <RotateCcw size={13} />
+                              <span>Retry This Page</span>
+                            </button>
+                          </div>
+                        )}
+
+                        {reviewMode === 'target' && (activePage.translationStatus === 'done') && (
+                          <div>
+                            <p className="text-[10px] text-slate-400 mb-3 flex items-center gap-1">
+                              💡 <strong>Interactive Editor:</strong> Click inside to make manual edits directly - changes save automatically.
+                            </p>
+                            {renderTargetPage({ editable: true, isPrimary: true })}
+                          </div>
+                        )}
+
+                        {/* PHASE 4: Compare mode - original page + translation side by side */}
+                        {reviewMode === 'compare' && (
+                          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+                            <div>
+                              <p className="text-[10px] font-bold text-slate-400 uppercase mb-2 text-center">Original Page</p>
+                              {renderSourcePage()}
+                            </div>
+                            <div>
+                              <p className="text-[10px] font-bold text-slate-400 uppercase mb-2 text-center">{targetLabel} Translation</p>
+                              {renderTargetPage({ editable: true, isPrimary: true })}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* PHASE 4: Overlay mode - source underneath, translation above with adjustable opacity */}
+                        {reviewMode === 'overlay' && (
+                          <div className="relative mx-auto" style={{ maxWidth: 880 }}>
+                            <div className="relative">
+                              <div style={{ position: 'relative' }}>
+                                {renderSourcePage()}
+                                <div style={{ position: 'absolute', inset: 0 }}>
+                                  {renderTargetPage({ editable: false, isPrimary: true, opacity: overlayOpacity })}
+                                </div>
+                              </div>
+                            </div>
+                            <p className="text-[10px] text-slate-400 text-center mt-3">Adjust the opacity slider above to compare block positions, missing content, and spacing between the original and the {targetLabel} translation.</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+              </div>
+            </div>
+
+          </div>
+        )}
+      </main>
+
+      {errorMsg && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-5 py-3.5 rounded-xl shadow-xl flex items-center gap-3 z-50 animate-in zoom-in slide-in-from-bottom-10 border border-slate-800 max-w-md w-[90%]">
+          <AlertCircle className="text-red-400 shrink-0" size={18} />
+          <span className="text-xs font-bold flex-1 leading-snug">{errorMsg}</span>
+          <button onClick={() => setErrorMsg(null)} className="p-1 hover:bg-white/10 rounded-lg text-slate-400 hover:text-white cursor-pointer">
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
+      {successMsg && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-emerald-950 text-emerald-100 px-5 py-3.5 rounded-xl shadow-xl flex items-center gap-3 z-50 animate-in zoom-in slide-in-from-bottom-10 border border-emerald-900 max-w-md w-[90%]">
+          <CheckCircle2 className="text-emerald-400 shrink-0" size={18} />
+          <span className="text-xs font-bold flex-1 leading-snug">{successMsg}</span>
+          <button onClick={() => setSuccessMsg(null)} className="p-1 hover:bg-white/10 rounded-lg text-emerald-400 hover:text-white cursor-pointer">
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
+    </div>
+  );
+};
+
+export default App;
