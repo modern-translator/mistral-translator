@@ -444,6 +444,29 @@ const buildFootnoteMetadata = (blocks) => {
   return { links, warnings };
 };
 
+// v6 FIX 8: rough estimate of body-paragraph count from vertical line spacing,
+// so the main translation prompt can be given a concrete checkable number
+// ("output approximately N paragraphs") instead of only a vague "match the
+// source" instruction. This is a best-effort estimate from spacing, not a
+// guaranteed-exact count - consecutive 'paragraph'-type lines with a
+// larger-than-typical vertical gap between them are treated as a paragraph
+// break.
+const estimateBodyParagraphCount = (structure) => {
+  const paraBlocks = (structure?.blocks || [])
+    .filter(b => b.type === 'paragraph' && typeof b.y === 'number')
+    .sort((a, b) => b.y - a.y); // PDF y increases upward - descending y = reading top to bottom
+
+  if (paraBlocks.length === 0) return null;
+
+  let count = 1;
+  for (let i = 1; i < paraBlocks.length; i++) {
+    const gap = paraBlocks[i - 1].y - paraBlocks[i].y;
+    const typicalLineHeight = paraBlocks[i].height || paraBlocks[i].fontSize || 14;
+    if (gap > typicalLineHeight * 1.6) count += 1;
+  }
+  return count;
+};
+
 const detectLikelyContinuation = (blocks) => {
   const contentBlocks = blocks.filter(b => !['header', 'footer', 'page_number'].includes(b.type));
   if (contentBlocks.length === 0) return { endsWithContinuation: false, lastBlockId: null };
@@ -1398,26 +1421,41 @@ const App = () => {
     }
   };
 
-  // v5 CALL 2: dedicated footnote translation, using the LOCAL (non-AI)
-  // structure classifier's already-isolated footnote blocks - no image, no
-  // full page re-send needed, since the footnote text is already known.
-  // Returns null (and makes NO API call) when the page has no footnote
-  // blocks at all - most pages don't, so this keeps average cost down.
+  // v6 FIX 3: markers are now pre-extracted by our own code (buildFootnoteMetadata's
+  // regex) and handed to the model as structured data to substitute VERBATIM,
+  // rather than asking the model to re-parse the marker out of raw text itself
+  // (which was producing wrong numbers, e.g. renumbered/converted markers).
   const translateFootnotesOnly = async (footnoteBlocks, targetCode) => {
     if (!footnoteBlocks || footnoteBlocks.length === 0) return null;
 
     const targetName = TARGET_LABELS[targetCode];
+    const structuredFootnotes = footnoteBlocks.map((b, idx) => {
+      const m = (b.text || '').match(/^([\d١-٩۱-۹]{1,3}|[*†‡])[.\)]?\s*(.*)$/s);
+      return {
+        marker: m ? m[1] : String(idx + 1),
+        text: m ? m[2] : b.text
+      };
+    });
+
     const footnoteSystemPrompt = `
-      You are translating ONLY a page's footnote block, in isolation - not the main body text, which is handled elsewhere. Translate each footnote line into ${targetName}, in the exact order given, keeping each footnote's leading marker (number/symbol) exactly as given - it is a REFERENCE identifier, not narrative content, so preserve its digit form rather than converting or renumbering it.
+      You are translating ONLY a page's footnote entries, in isolation - not the main body text, which is handled elsewhere.
+
+      For EACH footnote entry given in the user message, you are given its MARKER (the reference number/symbol) already extracted, separately from its TEXT. Use the given marker EXACTLY as provided, character for character, wrapped in <sup>...</sup> - do NOT re-derive it from the text yourself, do NOT renumber it, do NOT convert its digits to a different numeral script. Only translate the TEXT portion into ${targetName}.
 ${buildNumeralHandlingInstructions(targetCode)}
-      Output format - wrap ALL footnotes in one block exactly like this, one <p> per footnote line, nothing else:
-      <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;"><p style="color: #64748B; font-size: 14px;">[marker] [translated footnote text]</p>...</div>
+      --- BOOK/WORK TITLES - PRESERVE ORIGINAL SCRIPT, DO NOT TRANSLATE ---
+      If a footnote names a specific book or published work (e.g. a citation like "Sahih Al-Bukhari" or an Arabic book title), preserve that title in its ORIGINAL script and spelling rather than translating it - a translated title doesn't help a reader locate the actual book. Wrap a preserved Arabic/Urdu-script title in <span dir="rtl" style="font-family: 'Scheherazade New', 'Noto Naskh Arabic', serif; unicode-bidi: embed;">...</span>. Wrap a preserved English/Latin-script title in <span style="font-family: 'Times New Roman', Times, serif;">...</span>. You may still translate surrounding words like "translated by" or "published by" normally - only the title itself stays in its original script/font.
+
+      --- WEB ADDRESSES - NEVER TRANSLATE OR ALTER ---
+      Any web address / URL / domain name (e.g. www.example.com, example.com/page) is a literal identifier, not narrative text - reproduce it character-for-character exactly as given, untouched.
+
+      Output format - wrap ALL footnotes in one block exactly like this, one <p> per footnote entry, nothing else. The alignment MUST be left (not center, not justify) regardless of how other elements on the page are aligned - footnotes are always left-aligned:
+      <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;"><p style="text-align: left; color: #64748B; font-size: 14px;"><sup>[marker]</sup> [translated footnote text, with any preserved title spans]</p>...</div>
       Do not add commentary, do not use markdown code blocks, output raw HTML only.
     `;
     const footnoteUserPrompt = `
-      SOURCE FOOTNOTE LINES (in order):
+      SOURCE FOOTNOTE ENTRIES (marker already extracted - use it verbatim, only translate the text):
       """
-      ${footnoteBlocks.map(b => b.text).join('\n')}
+${structuredFootnotes.map(f => `      MARKER: ${f.marker}\n      TEXT: ${f.text}`).join('\n\n')}
       """
       Translate these into the footnotes HTML block described in the system message.
     `;
@@ -1436,6 +1474,22 @@ ${buildNumeralHandlingInstructions(targetCode)}
     // v5 CALL 3 (conditional): fix up the source text FIRST if it looks broken,
     // so every subsequent call works from good text instead of garbage.
     const effectivePageText = await runOcrIfNeeded(pageText, pageId, isPdf);
+
+    // v6 FIX 1: build a body-only version of the text with footnote-classified
+    // lines actually REMOVED (not just "please ignore this part"), so Call 1
+    // has no opportunity to translate the same footnote content that Call 2
+    // is independently translating - this is what was causing Page 8's
+    // duplicated content. Built from the same locally-classified blocks Call 2
+    // uses, so both calls agree on exactly what counts as "footnote" text.
+    const localFootnoteBlocks = (structure?.blocks || []).filter(b => b.type === 'footnote');
+    const ocrActuallyRan = effectivePageText !== pageText;
+    const bodyOnlyText = (!ocrActuallyRan && structure?.blocks && structure.blocks.length > 0)
+      ? structure.blocks.filter(b => b.type !== 'footnote').map(b => b.text).join(' ')
+      : effectivePageText; // OCR replaced the text, or no local structure available - block classification would be stale/unavailable, use the text as-is instead
+
+    // v6 FIX 8: concrete, checkable paragraph-count target instead of a vague
+    // "match the source" instruction.
+    const estimatedParagraphCount = estimateBodyParagraphCount(structure);
 
     let imagePayload = null;
     if (isPdf) {
@@ -1498,14 +1552,13 @@ ${buildNumeralHandlingInstructions(targetCode)}
       This rule OVERRIDES any instinct to produce smoother-sounding or more "complete" ${targetName} text. A literal, faithful translation of the correct sentence is always better than a fluent translation of the wrong sentence.
 
       ============================================================
-      RULE #1B - FOOTNOTE MARKERS ONLY (FOOTNOTE CONTENT IS HANDLED BY A SEPARATE DEDICATED PASS - DO NOT TRANSLATE FOOTNOTE TEXT YOURSELF)
+      RULE #1B - FOOTNOTE HANDLING (SPLIT RESPONSIBILITY - READ CAREFULLY)
       ============================================================
-      This page's footnote block (if it has one) is translated SEPARATELY by a different, dedicated call - not by you. Your job regarding footnotes is narrower and simpler:
-      Step 1: While translating the body text, keep every footnote reference marker (superscript number/symbol) exactly in place in your translation, in its exact original position - the marker is a structural element and must survive into the translation (as a REFERENCE NUMBER, see numeral handling below).
-      Step 2: Do NOT look ahead at the footnote block's content while translating the body, and do NOT translate the footnote block's content yourself - the footnote's MEANING must never be used to complete, clarify, or supplement the body sentence it's attached to (this is the single most common form of RULE #1 content-bleeding: a translator "borrows" a nearby footnote's wording because it's topically related).
-      Step 3: If the page has a footnote block at the bottom, insert EXACTLY this placeholder, once, in the correct position (physically separate from body <p> blocks, where the footnotes block belongs - typically after all body paragraphs): <div class="footnotes-placeholder"></div>
-      Step 4: If the page has NO footnote block at all, do not insert the placeholder - simply omit it.
-      Step 5: Never write your own <div class="footnotes">...</div> block with translated content inside it - that is the dedicated footnote call's job, not yours. Only the empty placeholder from Step 3 is your responsibility here.
+      This page's footnote text has ALREADY BEEN REMOVED from the "RAW TEXT CONTENT" you're given below, IF it was successfully detected by a local structural scan - it is translated separately by a different, dedicated call, not by you, so you will not normally see it at all.
+      Step 1: While translating the body text, keep every footnote reference marker (superscript number/symbol) exactly in place, in its exact original position, wrapped in <sup>...</sup> - the marker is a structural element and must survive into the translation (as a REFERENCE NUMBER, see numeral handling below).
+      Step 2: If the page visually has a footnote/reference block at the bottom (whether or not its text appears in what you were given), insert EXACTLY this placeholder ONCE, as the very LAST element in your entire output - after every other piece of content including any page number/footer text, since footnotes belong at the physical bottom of the page: <div class="footnotes-placeholder"></div>
+      Step 3: FALLBACK - if you can see small numbered reference/footnote text at the bottom of the page image that is NOT already covered by the placeholder in Step 2 (this means the local scan missed it and it's still present in what you were given), translate it yourself: wrap it in <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;"><p style="text-align: left; color: #64748B; font-size: 14px;"><sup>[marker]</sup> ...</p></div>, left-aligned, placed as the very last element. Do this ONLY if you can see footnote content that clearly isn't already accounted for by the placeholder - never produce both a placeholder AND your own footnotes div on the same page.
+      Step 4: If the page has no footnote block at all, do not insert anything footnote-related.
 
       ${buildMixedDirectionInstructions(targetLang)}
       ============================================================
@@ -1513,16 +1566,19 @@ ${buildNumeralHandlingInstructions(targetCode)}
       ============================================================
       The original Arabic/Urdu/English source text must NEVER appear anywhere in your output as a substitute for translation - only the ${targetName} translation is the deliverable, even for the densest citation-chain passages. (See the MIXED DIRECTION section above for the narrow, explicitly-marked exception of a short embedded original-script liturgical quotation kept alongside its ${targetName} rendering - that is not "leaving text untranslated", it is a deliberate scholarly convention already called for elsewhere in this prompt.)
 
+      --- WEB ADDRESSES - NEVER TRANSLATE OR ALTER ---
+      Any web address / URL / domain name (e.g. www.example.com, example.com/page) is a literal identifier, not narrative text - reproduce it character-for-character exactly as given, untouched, never translated or transliterated.
+
       --- IMAGE OCR & BLANK PAGE HANDLING ---
       The page text given to you in the user message has already been through a text-layer extraction step (and a dedicated OCR correction pass, if the original extraction looked broken) - treat it as reliable. If it still looks incomplete for a specific passage, cross-reference the provided page image as a fallback.
       If the image and text BOTH contain no readable content (a genuinely blank page), ignore all layout rules and output EXACTLY:
       <p style="text-align: center; color: #94A3B8; font-style: italic; font-size: 16px; margin-top: 40px;">No Text Found</p>
 
       --- LAYOUT FIDELITY (INCLUDING PARAGRAPH COUNT) ---
-      Preserve the EXACT paragraph breaks, lists, tables, and physical structure of the original page - do not re-order, combine, or split paragraphs, and do not summarize, omit, or add any text or meaning that isn't in the source. Only the LANGUAGE changes, to ${targetName}; the structure stays a 1:1 mirror. Concretely: the number of body <p> blocks you output should equal the number of distinct paragraphs visible in the source - if the source has 5 paragraphs, output 5 <p> blocks, not 3 merged ones and not 7 artificially split ones.
+      Preserve the EXACT paragraph breaks, lists, tables, and physical structure of the original page - do not re-order, combine, or split paragraphs, and do not summarize, omit, or add any text or meaning that isn't in the source. Only the LANGUAGE changes, to ${targetName}; the structure stays a 1:1 mirror.${estimatedParagraphCount ? ` A local structural scan estimates this page has approximately ${estimatedParagraphCount} body paragraph(s) - use this as a concrete target: output approximately ${estimatedParagraphCount} body <p> block(s), not noticeably more (artificially split) or fewer (artificially merged). This is a best-effort estimate from line spacing, not an absolute guarantee, so use your own visual judgment of the page if it clearly disagrees.` : ` If the source has 5 paragraphs, output 5 <p> blocks, not 3 merged ones and not 7 artificially split ones.`}
 
       --- TRANSLATE EVERY VISIBLE TEXT ELEMENT - NO EXCEPTIONS ---
-      Every visible piece of text on the page must be translated, including running headers/footers, journal/publication names, issue numbers, dates, and page numbers (small metadata strips at the top/bottom included). Nothing is left in the original language anywhere on the page (outside the narrow embedded-quotation exception above).
+      Every visible piece of text on the page must be translated, including running headers/footers, journal/publication names, issue numbers, dates, and page numbers (small metadata strips at the top/bottom included). Nothing is left in the original language anywhere on the page (outside the narrow embedded-quotation exception above, and the URL exception above).
 ${buildNumeralHandlingInstructions(targetLang)}
       --- NO INVENTED COMPLETIONS ---
       If a sentence, heading, or list item appears cut off at the bottom of the page, translate it AS CUT OFF - do not invent a completion from your own knowledge (even of a well-known hadith/verse), and do not add trailing punctuation that wasn't in the source.
@@ -1587,9 +1643,9 @@ ${glossaryExcerpt}
 ${repeatedMetadataHints}
 ` : ''}
 
-      RAW TEXT CONTENT (extracted from the page's text layer, or corrected via a dedicated OCR pass if the original extraction looked broken):
+      RAW TEXT CONTENT (extracted from the page's text layer, footnote text removed if locally detected - see RULE #1B, or corrected via a dedicated OCR pass if the original extraction looked broken):
       """
-      ${effectivePageText}
+      ${bodyOnlyText}
       """
 
       Now translate this page following every rule given in the system message above.
@@ -1610,8 +1666,7 @@ ${repeatedMetadataHints}
     // v5 CALL 2: translate footnotes in a separate, dedicated call using the
     // LOCAL (non-AI) structure classifier's already-isolated footnote blocks.
     // Skipped entirely (no API call) when the page has no footnote blocks.
-    const footnoteBlocks = (structure?.blocks || []).filter(b => b.type === 'footnote');
-    const footnotesHtml = await translateFootnotesOnly(footnoteBlocks, targetLang);
+    const footnotesHtml = await translateFootnotesOnly(localFootnoteBlocks, targetLang);
 
     let finalHtml = cleanedHtml;
     if (footnotesHtml) {
