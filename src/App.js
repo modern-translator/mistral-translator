@@ -98,7 +98,7 @@ const MAX_MISTRAL_KEY_LENGTH = 40;
 
 const MAX_RETRY_AFTER_MS = 30000;
 // Minimum 2 second gap between EVERY outgoing request (first attempt or retry).
-const REQUEST_INTERVAL_MS = 2000;
+const REQUEST_INTERVAL_MS = 2100;
 const LAST_REQUEST_TIME_STORAGE_KEY = 'translator_last_request_time_v1';
 
 // PHASE 1: lightweight, non-destructive validation of a translation result.
@@ -1367,7 +1367,76 @@ const App = () => {
   // top of the existing (protected) anti-substitution prompt. All new
   // sections are optional and degrade to the original whole-page prompt
   // behavior when structure/glossary data isn't available.
+  // v5 CALL 3 (CONDITIONAL): dedicated OCR pass, only when the page's
+  // pdf.js-extracted text layer looks empty/broken. Most pages already have
+  // a perfectly good text layer extracted for free during upload, so this
+  // should rarely fire - it is NOT a fixed step every page goes through.
+  const runOcrIfNeeded = async (pageText, pageId, isPdf) => {
+    const looksEmpty = !pageText || pageText.trim().length < 20;
+    if (!isPdf || !looksEmpty) {
+      return pageText; // text layer is fine, no extra API call needed
+    }
+
+    const base64Image = await extractPageImageBase64(pageId);
+    if (!base64Image) return pageText; // no image available either, nothing more we can do
+
+    const ocrSystemPrompt = `
+      You are performing OCR only - not translation, not formatting. Read the attached page image and transcribe its ORIGINAL-LANGUAGE text (Arabic, Urdu, or English) as accurately as possible, preserving line/paragraph breaks with blank lines between paragraphs. Include footnote text and any header/footer text you can read. Output PLAIN TEXT ONLY - no HTML, no translation, no commentary, no markdown formatting. If the page is genuinely blank, output exactly: [BLANK PAGE]
+    `;
+
+    try {
+      const data = await callMistral([
+        { text: "Transcribe this page's text exactly as it appears." },
+        { inlineData: { mimeType: "image/jpeg", data: base64Image } }
+      ], ocrSystemPrompt);
+
+      const ocrText = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+      return (ocrText && !/^\[BLANK PAGE\]$/i.test(ocrText)) ? ocrText : pageText;
+    } catch (e) {
+      console.warn("OCR pass failed, falling back to original extracted text:", e);
+      return pageText; // never let a failed OCR call block the main translation
+    }
+  };
+
+  // v5 CALL 2: dedicated footnote translation, using the LOCAL (non-AI)
+  // structure classifier's already-isolated footnote blocks - no image, no
+  // full page re-send needed, since the footnote text is already known.
+  // Returns null (and makes NO API call) when the page has no footnote
+  // blocks at all - most pages don't, so this keeps average cost down.
+  const translateFootnotesOnly = async (footnoteBlocks, targetCode) => {
+    if (!footnoteBlocks || footnoteBlocks.length === 0) return null;
+
+    const targetName = TARGET_LABELS[targetCode];
+    const footnoteSystemPrompt = `
+      You are translating ONLY a page's footnote block, in isolation - not the main body text, which is handled elsewhere. Translate each footnote line into ${targetName}, in the exact order given, keeping each footnote's leading marker (number/symbol) exactly as given - it is a REFERENCE identifier, not narrative content, so preserve its digit form rather than converting or renumbering it.
+${buildNumeralHandlingInstructions(targetCode)}
+      Output format - wrap ALL footnotes in one block exactly like this, one <p> per footnote line, nothing else:
+      <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;"><p style="color: #64748B; font-size: 14px;">[marker] [translated footnote text]</p>...</div>
+      Do not add commentary, do not use markdown code blocks, output raw HTML only.
+    `;
+    const footnoteUserPrompt = `
+      SOURCE FOOTNOTE LINES (in order):
+      """
+      ${footnoteBlocks.map(b => b.text).join('\n')}
+      """
+      Translate these into the footnotes HTML block described in the system message.
+    `;
+
+    try {
+      const data = await callMistral([{ text: footnoteUserPrompt }], footnoteSystemPrompt);
+      const raw = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").replace(/```html|```/gi, '').trim();
+      return raw || null;
+    } catch (e) {
+      console.warn("Dedicated footnote translation call failed:", e);
+      return null; // caller falls back gracefully - see merge step below
+    }
+  };
+
   const translatePage = async (pageText, pageId, isPdf, structure = null, prevPageStructure = null, glossaryList = []) => {
+    // v5 CALL 3 (conditional): fix up the source text FIRST if it looks broken,
+    // so every subsequent call works from good text instead of garbage.
+    const effectivePageText = await runOcrIfNeeded(pageText, pageId, isPdf);
+
     let imagePayload = null;
     if (isPdf) {
       const base64Image = await extractPageImageBase64(pageId);
@@ -1429,14 +1498,14 @@ const App = () => {
       This rule OVERRIDES any instinct to produce smoother-sounding or more "complete" ${targetName} text. A literal, faithful translation of the correct sentence is always better than a fluent translation of the wrong sentence.
 
       ============================================================
-      RULE #1B - FOOTNOTE HANDLING (READ THIS SECOND - MOVED UP BECAUSE IT IS COMMONLY MISHANDLED)
+      RULE #1B - FOOTNOTE MARKERS ONLY (FOOTNOTE CONTENT IS HANDLED BY A SEPARATE DEDICATED PASS - DO NOT TRANSLATE FOOTNOTE TEXT YOURSELF)
       ============================================================
-      Step 1: Read the ENTIRE body text of the page first, top to bottom, ignoring the footnote block completely for now.
-      Step 2: While reading the body, keep every footnote reference marker (superscript number/symbol) exactly in place in your translation - the marker is a structural element and must survive into the translation (as a REFERENCE NUMBER, see numeral handling below). Do NOT look ahead at the footnote block's content while translating the body - the footnote's MEANING must never be used to complete, clarify, or supplement the body sentence it's attached to (this is the single most common form of RULE #1 content-bleeding: a translator "borrows" a nearby footnote's wording because it's topically related).
-      Step 3: Only after the ENTIRE body is translated, separately read and translate the footnote block, footnote-by-footnote, each strictly from its own text.
-      Step 4: Cross-check by marker number: every marker that appears in the body must have exactly one matching footnote entry with the same number, and every footnote entry's number must appear exactly once in the body. List them out mentally (marker 1 -> footnote 1, marker 2 -> footnote 2, ...) and confirm none are missing, duplicated, or mismatched.
-      Step 5: Compare body vs. footnote translations sentence-by-sentence: if any exact sentence appears in both, that is an error - remove the duplicate from the body and restore the body's own faithful (possibly shorter/cut-off) translation instead.
-      Step 6: Footnotes belong in their own <div class="footnotes">...</div> block (see styling below), physically separate from the body <p> blocks - never interleave a footnote's translated text into the middle of a body paragraph.
+      This page's footnote block (if it has one) is translated SEPARATELY by a different, dedicated call - not by you. Your job regarding footnotes is narrower and simpler:
+      Step 1: While translating the body text, keep every footnote reference marker (superscript number/symbol) exactly in place in your translation, in its exact original position - the marker is a structural element and must survive into the translation (as a REFERENCE NUMBER, see numeral handling below).
+      Step 2: Do NOT look ahead at the footnote block's content while translating the body, and do NOT translate the footnote block's content yourself - the footnote's MEANING must never be used to complete, clarify, or supplement the body sentence it's attached to (this is the single most common form of RULE #1 content-bleeding: a translator "borrows" a nearby footnote's wording because it's topically related).
+      Step 3: If the page has a footnote block at the bottom, insert EXACTLY this placeholder, once, in the correct position (physically separate from body <p> blocks, where the footnotes block belongs - typically after all body paragraphs): <div class="footnotes-placeholder"></div>
+      Step 4: If the page has NO footnote block at all, do not insert the placeholder - simply omit it.
+      Step 5: Never write your own <div class="footnotes">...</div> block with translated content inside it - that is the dedicated footnote call's job, not yours. Only the empty placeholder from Step 3 is your responsibility here.
 
       ${buildMixedDirectionInstructions(targetLang)}
       ============================================================
@@ -1445,7 +1514,7 @@ const App = () => {
       The original Arabic/Urdu/English source text must NEVER appear anywhere in your output as a substitute for translation - only the ${targetName} translation is the deliverable, even for the densest citation-chain passages. (See the MIXED DIRECTION section above for the narrow, explicitly-marked exception of a short embedded original-script liturgical quotation kept alongside its ${targetName} rendering - that is not "leaving text untranslated", it is a deliberate scholarly convention already called for elsewhere in this prompt.)
 
       --- IMAGE OCR & BLANK PAGE HANDLING ---
-      If the page's extracted text layer (given to you in the user message) is empty, garbage, or incomplete (e.g. a scanned image-only PDF), rely ENTIRELY on the provided page image to perform OCR and read the full source text accurately before translating.
+      The page text given to you in the user message has already been through a text-layer extraction step (and a dedicated OCR correction pass, if the original extraction looked broken) - treat it as reliable. If it still looks incomplete for a specific passage, cross-reference the provided page image as a fallback.
       If the image and text BOTH contain no readable content (a genuinely blank page), ignore all layout rules and output EXACTLY:
       <p style="text-align: center; color: #94A3B8; font-style: italic; font-size: 16px; margin-top: 40px;">No Text Found</p>
 
@@ -1482,7 +1551,7 @@ ${buildNumeralHandlingInstructions(targetLang)}
       2. Subheading: <p style="color: #0F172A; font-size: [18-19px]; font-weight: bold; margin-bottom: 12px; border-bottom: 1px solid #E2E8F0; padding-bottom: 8px;">...</p>
       3. Body text: <p style="text-align: [observed alignment, justify as fallback]; color: #334155; font-size: [16-18px]; line-height: 1.8; margin-bottom: 16px;">...</p>
       4. Highlights: <span style="color: #BE123C; font-weight: bold;">...</span> for emphasis/Quranic verses/key terms.
-      5. Footnotes: <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;"><p style="color: #64748B; font-size: [13-14px];">...</p></div>
+      5. Footnotes: NOT your responsibility here - see RULE #1B above, just insert the <div class="footnotes-placeholder"></div> marker if the page has footnotes, nothing more.
       6. Preserve Quranic verses / Arabic religious terms with standard ${targetName} transliteration or brief explanation where appropriate.
 
       DO NOT use markdown code blocks (\`\`\`html). Output raw styled HTML directly.
@@ -1518,9 +1587,9 @@ ${glossaryExcerpt}
 ${repeatedMetadataHints}
 ` : ''}
 
-      RAW TEXT CONTENT (extracted from the page's text layer - may be empty/garbled if this is a scanned/image-only page):
+      RAW TEXT CONTENT (extracted from the page's text layer, or corrected via a dedicated OCR pass if the original extraction looked broken):
       """
-      ${pageText}
+      ${effectivePageText}
       """
 
       Now translate this page following every rule given in the system message above.
@@ -1538,6 +1607,29 @@ ${repeatedMetadataHints}
     // can merge them into the document glossary.
     const { cleanedHtml, suggestions } = parseGlossarySuggestionsFromResponse(rawResponse);
 
+    // v5 CALL 2: translate footnotes in a separate, dedicated call using the
+    // LOCAL (non-AI) structure classifier's already-isolated footnote blocks.
+    // Skipped entirely (no API call) when the page has no footnote blocks.
+    const footnoteBlocks = (structure?.blocks || []).filter(b => b.type === 'footnote');
+    const footnotesHtml = await translateFootnotesOnly(footnoteBlocks, targetLang);
+
+    let finalHtml = cleanedHtml;
+    if (footnotesHtml) {
+      if (finalHtml.includes('<div class="footnotes-placeholder"></div>')) {
+        // Normal case: Call 1 correctly left the placeholder - swap it in.
+        finalHtml = finalHtml.replace('<div class="footnotes-placeholder"></div>', footnotesHtml);
+      } else {
+        // Fallback: Call 1 forgot the placeholder despite instructions - never
+        // let Call 2's real, successfully-translated footnotes get silently
+        // dropped just because of that. Append them at the end instead.
+        finalHtml = finalHtml + footnotesHtml;
+      }
+    } else {
+      // No footnotes translated (either none exist, or Call 2 failed) - strip
+      // any leftover empty placeholder so it doesn't render as a stray element.
+      finalHtml = finalHtml.replace('<div class="footnotes-placeholder"></div>', '');
+    }
+
     // PHASE 3: the previous blanket "force every direction:rtl / text-align:right
     // to ltr" post-processing has been REMOVED here on purpose (per instructions:
     // do not globally replace RTL with LTR anywhere). The page-level LTR
@@ -1546,11 +1638,11 @@ ${repeatedMetadataHints}
     // already force `direction: ltr` at the container level), which leaves
     // room for legitimate local dir="rtl" spans inside the output.
 
-    return { html: cleanedHtml, glossarySuggestions: suggestions };
+    return { html: finalHtml, glossarySuggestions: suggestions };
   };
 
   // Verification & auto-correction pass.
-  const verifyAndCorrectTranslation = async (pageText, pageId, isPdf, translatedHtmlDraft) => {
+  const verifyAndCorrectTranslation = async (pageText, pageId, isPdf, translatedHtmlDraft, structure = null) => {
     let imagePayload = null;
     if (isPdf) {
       const base64Image = await extractPageImageBase64(pageId);
@@ -1565,26 +1657,48 @@ ${repeatedMetadataHints}
     }
 
     const verifyTargetName = TARGET_LABELS[targetLang];
+    const verifyBlockMapSection = buildBlockMapPromptSection(structure);
+    const sourceFootnoteBlocks = (structure?.blocks || []).filter(b => b.type === 'footnote');
 
-    // PHASE 2: audit checklist and output-format rules are stable regardless
-    // of which page is being checked - system message.
+    // PHASE 2 + v5 STRENGTHENED: audit checklist and output-format rules are
+    // stable regardless of which page is being checked - system message.
+    // COMPLETENESS is now checklist item #1 (elevated to top priority,
+    // above even content-substitution) because real testing showed pages
+    // losing entire trailing sections (closing paragraphs, signatures, and
+    // footnotes all missing at once) - a more severe failure than a
+    // mistranslated word, and one this audit pass was not explicitly
+    // checking for before. This is also the main safety net against the
+    // new footnote-specific API call (in the main translation pipeline)
+    // silently failing or returning nothing for a given page.
     const verifySystemPrompt = `
-      YOU ARE A PROOFREADER/AUDITOR, NOT A TRANSLATOR. Your job is to CHECK an existing ${verifyTargetName} translation against its original source page, and fix ONLY real errors you find - not to re-translate from scratch or rewrite style choices you simply would have phrased differently.
+      YOU ARE A PROOFREADER/AUDITOR, NOT A TRANSLATOR. Your job is to CHECK an existing ${verifyTargetName} translation against its original source page, and fix errors you find. Unlike a first-pass translation, thoroughness matters more than brevity here - take as much space as you need, and do not hesitate to substantially rebuild a section if you find it is genuinely missing or badly wrong, even though your default should still be to preserve parts that are already correct rather than rephrasing them for style.
 
-      Check specifically for these failure modes, one by one:
-      1. CONTENT SUBSTITUTION: does each paragraph's ${verifyTargetName} actually correspond to THAT SAME paragraph's source text, or did content drift in from a nearby quotation, footnote, or adjacent paragraph discussing a related topic?
-      2. HALLUCINATION / INVENTED COMPLETIONS: did the translation add words, sentences, or punctuation not present in the source - especially completing a sentence that was actually cut off at the bottom of the page?
-      3. FOOTNOTE MARKERS: does every footnote reference marker (superscript number/symbol) in the body have a matching footnote entry, and vice versa? Did any footnote's meaning bleed into the body text (or an identical sentence appear in both)? Are footnotes kept in their own separate <div class="footnotes"> block rather than interleaved into body paragraphs?
-      4. ORIGINAL-LANGUAGE LEFTOVERS: does any Arabic/Urdu/English text remain anywhere in the output that should have been translated to ${verifyTargetName} (outside a deliberately marked, narrow embedded-quotation exception)?
-      5. VISUAL ELEMENT PLACEHOLDERS: compare the page image (if provided) against the HTML - is any photograph, diagram, chart, graph, map, table-as-image, illustration, icon, stamp, seal, or logo visible on the page missing its placeholder <div class="diagram-placeholder">...</div> block? Conversely, was any purely decorative/calligraphic text or divider line incorrectly turned into a placeholder when it should have just been translated as text?
-      6. HEADERS/FOOTERS/PAGE NUMBERS: is every peripheral text element (running header/footer, journal name, issue number, date, page number) fully translated to ${verifyTargetName}, using narrative-numeral conventions rather than reference-numeral ones?
-      7. NUMERAL HANDLING: were any REFERENCE numbers (footnote markers, citation numbers, page/volume/issue numbers used as identifiers) incorrectly converted or reformatted when they should have been preserved exactly as identifiers?
-      8. PARAGRAPH COUNT: does the number of body <p> blocks in the translation roughly match the number of distinct paragraphs in the source (not artificially merged or split)?
-      9. ALIGNMENT & SIZE FIDELITY: does each block's text-align and relative font-size roughly reflect what's actually observed in the source image, rather than every heading being force-centered and every body paragraph force-justified regardless of the source?
+      Check specifically for these failure modes, IN THIS PRIORITY ORDER - completeness first, since missing content is the most severe and most common failure this audit exists to catch:
+
+      1. COMPLETENESS (CHECK THIS FIRST AND MOST CAREFULLY): compare the source page (text and image) against the translation HTML section by section, from the very top of the page to the very bottom, including the last paragraph before the page ends. Is there ANY sentence, paragraph, heading, signature line, credential line, or closing remark present in the source that has NO corresponding translated content anywhere in the HTML? Pay special attention to the END of the page - content just before a page cuts off is exactly what gets dropped when a response runs out of steam, so deliberately re-check the source's last 2-3 paragraphs specifically. If you find missing content, TRANSLATE IT YOURSELF NOW and insert it in the correct position in the HTML - do not just flag it, actually add it.
+      ${verifyBlockMapSection ? `
+      For reference, here is this page's source block map (id, type, short snippet) from local structural analysis - use it as a checklist to confirm every block has SOME corresponding translated content, especially block types other than "paragraph" (headings, quotes, citations) which are easier to accidentally skip:
+${verifyBlockMapSection}
+` : ''}
+      ${sourceFootnoteBlocks.length > 0 ? `
+      This page's source has ${sourceFootnoteBlocks.length} footnote block(s) detected by local analysis. The translation was generated with footnotes handled by a SEPARATE dedicated API call, which can occasionally fail or return nothing even when the main translation succeeds. Explicitly check: does the HTML contain a non-empty <div class="footnotes">...</div> block with translated content for all ${sourceFootnoteBlocks.length} footnote(s)? If it's missing, empty, or incomplete, translate the missing footnote(s) yourself now from this source footnote text and insert a proper <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;">...</div> block with one <p style="color: #64748B; font-size: 14px;"> per footnote, in the correct position:
+${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
+` : ''}
+
+      2. CONTENT SUBSTITUTION: does each paragraph's ${verifyTargetName} actually correspond to THAT SAME paragraph's source text, or did content drift in from a nearby quotation, footnote, or adjacent paragraph discussing a related topic?
+      3. FACTUAL/NAME ACCURACY: are proper names, titles, and technical terms translated correctly and consistently - not swapped for a similar-sounding but different name or term (e.g. translating one scholar's name as if it were a different scholar's name)? Cross-check any name or title you're unsure of against how it's written in the source text/image.
+      4. HALLUCINATION / INVENTED COMPLETIONS: did the translation add words, sentences, or punctuation not present in the source - especially completing a sentence that was actually cut off at the bottom of the page?
+      5. FOOTNOTE MARKERS: does every footnote reference marker (superscript number/symbol) in the body have a matching footnote entry, and vice versa? Are footnotes kept in their own separate <div class="footnotes"> block rather than interleaved into body paragraphs?
+      6. ORIGINAL-LANGUAGE LEFTOVERS: does any Arabic/Urdu/English text remain anywhere in the output that should have been translated to ${verifyTargetName} (outside a deliberately marked, narrow embedded-quotation exception)? Watch specifically for a foreign-language phrase left untranslated in the middle of an otherwise-translated sentence (e.g. wrapped in an emphasis/highlight span instead of actually being translated).
+      7. VISUAL ELEMENT PLACEHOLDERS: compare the page image (if provided) against the HTML - is any photograph, diagram, chart, graph, map, table-as-image, illustration, icon, stamp, seal, or logo visible on the page missing its placeholder <div class="diagram-placeholder">...</div> block? Conversely, was any purely decorative/calligraphic text or divider line incorrectly turned into a placeholder when it should have just been translated as text?
+      8. HEADERS/FOOTERS/PAGE NUMBERS: is every peripheral text element (running header/footer, journal name, issue number, date, page number) fully translated to ${verifyTargetName}, using narrative-numeral conventions rather than reference-numeral ones?
+      9. NUMERAL HANDLING: were any REFERENCE numbers (footnote markers, citation numbers, page/volume/issue numbers used as identifiers) incorrectly converted or reformatted when they should have been preserved exactly as identifiers?
+      10. PARAGRAPH COUNT: does the number of body <p> blocks in the translation roughly match the number of distinct paragraphs in the source (not artificially merged or split)?
+      11. ALIGNMENT & SIZE FIDELITY: does each block's text-align and relative font-size roughly reflect what's actually observed in the source image, rather than every heading being force-centered and every body paragraph force-justified regardless of the source?
 
       OUTPUT RULES:
-      - If you find NO issues after checking all nine points above, respond with EXACTLY this sentinel text and nothing else: NO_CORRECTIONS_NEEDED
-      - If you find ANY issue, respond with the FULL corrected HTML (same format/styling conventions as the input - styled <p>/<div>/<span> tags, ${verifyTargetName} text, page-level LTR direction with only narrow local dir="rtl" spans where explicitly appropriate), with ONLY the specific errors fixed. Do not rewrite or rephrase parts that were already correct - preserve everything that wasn't actually wrong.
+      - If you find NO issues after checking all eleven points above, respond with EXACTLY this sentinel text and nothing else: NO_CORRECTIONS_NEEDED
+      - If you find ANY issue, respond with the FULL corrected HTML (same format/styling conventions as the input - styled <p>/<div>/<span> tags, ${verifyTargetName} text, page-level LTR direction with only narrow local dir="rtl" spans where explicitly appropriate), with the errors fixed AND any missing content from point 1 actually added in. Preserve parts that were already correct rather than rephrasing them for style, but do not let that caution stop you from adding substantial missing content when point 1 finds it.
       - Do not use markdown code blocks. Output either the sentinel text alone, or raw HTML alone - never both, never any other commentary.
     `;
 
@@ -1715,7 +1829,7 @@ ${repeatedMetadataHints}
       s.id === pageId ? { ...s, translationStatus: 'verifying' } : s
     )));
 
-    const finalHtml = await verifyAndCorrectTranslation(page.content.rawText, page.id, page.isPdf, page.translatedHtml);
+    const finalHtml = await verifyAndCorrectTranslation(page.content.rawText, page.id, page.isPdf, page.translatedHtml, page.structure);
 
     setParsedSections(prev => prev.map(s => (
       s.id === pageId
