@@ -467,6 +467,143 @@ const estimateBodyParagraphCount = (structure) => {
   return count;
 };
 
+// =============================================================================
+// v7 TWO-PHASE PIPELINE - ASSEMBLY ENGINE (pure code, zero AI judgment)
+//
+// Phase A ("Extraction") decides EVERYTHING about a block's structure/appearance
+// (type, alignment, size tier, color, where emphasis/footnote-refs sit within
+// the text) and returns it as JSON, in the ORIGINAL language.
+// Phase B ("Translation") receives ONLY {id, text} pairs for translatable
+// blocks and returns ONLY {id, translatedText} - it never sees or decides
+// alignment/size/color/type, and it must preserve two literal token types
+// verbatim (untranslated, unmoved) rather than deciding formatting itself:
+//   - a footnote-reference token marking exactly where an inline superscript
+//     marker belongs within body text
+//   - a highlight-span token marking exactly which words are emphasized
+// This function (assemblePage) then combines Phase A's locked structure with
+// Phase B's translated words - using the SAME fixed style rules every time,
+// in a SAME fixed element order every time - to produce the final HTML. No
+// call, AI or otherwise, ever decides formatting at assembly time.
+// =============================================================================
+
+const FN_TOKEN_RE = /⟦FN:([^⟧]{1,6})⟧/g;
+const HL_TOKEN_RE = /⟦HL⟧([\s\S]*?)⟦\/HL⟧/g;
+
+// Converts Phase A's inline structural tokens (already present, verbatim, in
+// either the original text or Phase B's translated text - both are handled
+// identically here) into real HTML. This is the ONLY place these tokens ever
+// become actual <sup>/<span> markup - neither Phase A nor Phase B outputs
+// real HTML tags inside block text, only these plain-text placeholder tokens,
+// which keeps Phase B's literal find/replace job unambiguous.
+const applyInlineTokens = (text) => {
+  if (!text) return text;
+  return text
+    .replace(HL_TOKEN_RE, '<span style="color: #BE123C; font-weight: bold;">$1</span>')
+    .replace(FN_TOKEN_RE, '<sup>$1</sup>');
+};
+
+const SIZE_TIER_PX = {
+  large_heading: '27px',
+  medium_heading: '21px',
+  subheading: '18px',
+  body: '17px',
+  small: '14px'
+};
+
+const escapeAttr = (s) => String(s || '').replace(/"/g, '&quot;');
+
+// Renders exactly ONE block's HTML from Phase A's locked data + its final
+// text (Phase B's translation for translatable blocks, or Phase A's own
+// original-language text unchanged for preserve=true blocks like URLs/icons/
+// preserved book titles). Every style decision here comes from `block` -
+// never re-judged, never guessed, always the same mapping.
+const renderBlockHtml = (block, finalText, targetLang) => {
+  const align = block.align || 'left';
+  const sizePx = SIZE_TIER_PX[block.sizeTier] || SIZE_TIER_PX.body;
+  const color = block.color || null;
+  const idAttr = block.id ? ` data-block-id="${escapeAttr(block.id)}"` : '';
+  const content = applyInlineTokens(finalText || '');
+
+  if (block.type === 'image') {
+    return `<div class="diagram-placeholder" style="border: 2px dashed #CBD5E1; padding: 20px; text-align: center; border-radius: 8px; margin: 16px 0; cursor: pointer;"${idAttr}><p style="font-size: 14px; color: #64748B; margin-bottom: 8px;">📤 Image Detected. Click here to upload replacement.</p></div>`;
+  }
+
+  if (block.type === 'heading') {
+    return `<p style="text-align: ${align}; color: ${color || '#4338CA'}; font-size: ${sizePx}; font-weight: bold; margin-bottom: 20px;"${idAttr}>${content}</p>`;
+  }
+  if (block.type === 'subheading') {
+    return `<p style="text-align: ${align}; color: ${color || '#0F172A'}; font-size: ${sizePx}; font-weight: bold; margin-bottom: 12px; border-bottom: 1px solid #E2E8F0; padding-bottom: 8px;"${idAttr}>${content}</p>`;
+  }
+  if (block.type === 'url') {
+    return `<p style="text-align: ${align}; color: ${color || '#334155'}; font-size: ${sizePx}; line-height: 1.8; margin-bottom: 16px;"${idAttr}><a href="${escapeAttr(finalText)}" style="color: #2563EB; text-decoration: underline;">${escapeAttr(finalText)}</a></p>`;
+  }
+  if (block.type === 'icon') {
+    return `<p style="text-align: ${align}; font-size: ${sizePx}; margin-bottom: 8px;"${idAttr}>${escapeAttr(finalText)}</p>`;
+  }
+  // paragraph, quote, citation, list_item all share the body template
+  return `<p style="text-align: ${align}; color: ${color || '#334155'}; font-size: ${sizePx}; line-height: 1.8; margin-bottom: 16px;"${idAttr}>${content}</p>`;
+};
+
+// Assembles the full page from Phase A's locked structure + Phase B's
+// translation map ({blockId: translatedText}). Element ORDER here is fixed
+// by this function, never by an AI's placement judgment - header first, body
+// blocks in their given order, all footnotes collected into ONE block,
+// footer, then page number, always in that sequence. This is what makes
+// "floating page number" / "misplaced footnotes" structurally impossible
+// rather than merely instructed against.
+const assemblePage = (extraction, translationMap, targetLang) => {
+  if (!extraction) return '';
+
+  const textFor = (block) => {
+    if (block.preserve) return block.text || '';
+    return translationMap[block.id] ?? block.text ?? '';
+  };
+
+  const headerHtml = (extraction.header?.lines || [])
+    .map(line => `<p style="text-align: ${line.align || 'left'}; color: #94A3B8; font-size: ${SIZE_TIER_PX[line.sizeTier] || SIZE_TIER_PX.small}; margin-bottom: 4px;">${applyInlineTokens(translationMap[`header:${line.id}`] ?? line.text ?? '')}</p>`)
+    .join('');
+
+  const bodyBlocks = (extraction.blocks || []).filter(b => b.type !== 'footnote');
+  const bodyHtml = bodyBlocks.map(b => renderBlockHtml(b, textFor(b), targetLang)).join('');
+
+  const footnoteBlocks = (extraction.blocks || []).filter(b => b.type === 'footnote');
+  const footnotesHtml = footnoteBlocks.length > 0
+    ? `<div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;">${footnoteBlocks.map(b => `<p style="text-align: left; color: #64748B; font-size: 14px;"><sup>${escapeAttr(b.marker || '')}</sup> ${applyInlineTokens(textFor(b))}</p>`).join('')}</div>`
+    : '';
+
+  const footerHtml = (extraction.footer?.lines || [])
+    .map(line => `<p style="text-align: ${line.align || 'center'}; color: #94A3B8; font-size: ${SIZE_TIER_PX[line.sizeTier] || SIZE_TIER_PX.small}; margin-top: 4px;">${applyInlineTokens(translationMap[`footer:${line.id}`] ?? line.text ?? '')}</p>`)
+    .join('');
+
+  const pageNumberHtml = extraction.pageNumber?.text
+    ? `<p style="text-align: ${extraction.pageNumber.align || 'center'}; color: #94A3B8; font-size: 13px; margin-top: 8px;">${escapeAttr(extraction.pageNumber.text)}</p>`
+    : '';
+
+  return headerHtml + bodyHtml + footnotesHtml + footerHtml + pageNumberHtml;
+};
+
+// Robust JSON extraction from a model response - strips markdown fences, and
+// if the model wrapped valid JSON in any commentary, extracts the outermost
+// {...} object instead of failing outright.
+const parseJsonFromModelResponse = (rawText) => {
+  if (!rawText) return null;
+  let cleaned = rawText.replace(/```json|```/gi, '').trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    const firstBrace = cleaned.indexOf('{');
+    const lastBrace = cleaned.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      try {
+        return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+      } catch (e2) {
+        return null;
+      }
+    }
+    return null;
+  }
+};
+
 const detectLikelyContinuation = (blocks) => {
   const contentBlocks = blocks.filter(b => !['header', 'footer', 'page_number'].includes(b.type));
   if (contentBlocks.length === 0) return { endsWithContinuation: false, lastBlockId: null };
@@ -1209,7 +1346,13 @@ const App = () => {
             retryCount: 0,
             translationStatus: 'idle',
             isPdf: true,
-            structure
+            structure,
+            // v7: Phase A's locked structural/visual JSON, and Phase B's
+            // translated block texts - stored separately and persistently so
+            // Retranslate (Phase B only) and Retry (whichever phase failed)
+            // can reuse whichever phase already succeeded without redoing it.
+            extraction: null,
+            translatedBlocks: null
           });
         }
       }
@@ -1394,383 +1537,251 @@ const App = () => {
   // pdf.js-extracted text layer looks empty/broken. Most pages already have
   // a perfectly good text layer extracted for free during upload, so this
   // should rarely fire - it is NOT a fixed step every page goes through.
-  const runOcrIfNeeded = async (pageText, pageId, isPdf) => {
-    const looksEmpty = !pageText || pageText.trim().length < 20;
-    if (!isPdf || !looksEmpty) {
-      return pageText; // text layer is fine, no extra API call needed
+  // =============================================================================
+  // v7 PHASE A - "EXTRACTION": the ONLY call that sees the image and makes ANY
+  // structural/visual judgment (block type, alignment, size tier, color, header/
+  // footer line breakdown, page number, footnote marker+text, image detection,
+  // URL/icon detection, where inline emphasis/footnote-ref tokens belong).
+  // Output is JSON, entirely in the ORIGINAL language - nothing is translated
+  // here. Also absorbs the old conditional-OCR logic: since this call already
+  // needs the image for every other judgment, a separate OCR call is no longer
+  // needed - if the text layer looks broken, the same call just relies more on
+  // the image for reading text too.
+  // =============================================================================
+  const runExtraction = async (pageText, pageId, isPdf, structure, prevPageStructure) => {
+    let imagePayload = null;
+    if (isPdf) {
+      const base64Image = await extractPageImageBase64(pageId);
+      if (base64Image) {
+        imagePayload = { inlineData: { mimeType: "image/jpeg", data: base64Image } };
+      }
     }
 
-    const base64Image = await extractPageImageBase64(pageId);
-    if (!base64Image) return pageText; // no image available either, nothing more we can do
+    const contextSection = buildContextPromptSection(structure, prevPageStructure);
+    const estimatedParagraphCount = estimateBodyParagraphCount(structure);
+    const textLooksBroken = !pageText || pageText.trim().length < 20;
 
-    const ocrSystemPrompt = `
-      You are performing OCR only - not translation, not formatting. Read the attached page image and transcribe its ORIGINAL-LANGUAGE text (Arabic, Urdu, or English) as accurately as possible, preserving line/paragraph breaks with blank lines between paragraphs. Include footnote text and any header/footer text you can read. Output PLAIN TEXT ONLY - no HTML, no translation, no commentary, no markdown formatting. If the page is genuinely blank, output exactly: [BLANK PAGE]
+    const extractionSystemPrompt = `
+      You are analyzing ONE page's STRUCTURE and VISUAL APPEARANCE only. Do NOT translate anything - every "text" field you output stays in the page's ORIGINAL language (Arabic, Urdu, or English), exactly as printed. A separate step handles translation afterward, working entirely from what you output here - so be thorough and precise, since anything you miss or mis-tag will not get a second chance to be caught downstream.
+
+      ${textLooksBroken ? 'The extracted text layer for this page looks empty or broken - rely ENTIRELY on the page image to read the text accurately (this is effectively an OCR task for this page).' : "You're given an extracted text layer below as a starting point - cross-reference it against the image, correcting anything that looks wrong."}
+      ${contextSection ? `\n      DOCUMENT CONTEXT (for judging whether this page's first paragraph continues from the previous page, etc - does not change what text belongs to THIS page):\n${contextSection}\n` : ''}
+
+      Output ONLY a single JSON object (no markdown fences, no commentary before or after), in exactly this shape:
+      {
+        "pageNumber": { "text": "...", "align": "center" } or null if none visible,
+        "header": { "lines": [ { "id": "h1", "text": "...", "align": "left", "sizeTier": "small" } ] } or { "lines": [] } if none,
+        "footer": { "lines": [ { "id": "f1", "text": "...", "align": "center", "sizeTier": "small" } ] } or { "lines": [] } if none,
+        "blocks": [ ... see block shape below ... ],
+        "paragraphCount": <number of distinct body paragraphs you identified>
+      }
+
+      EACH block in "blocks" (in top-to-bottom reading order) has this shape:
+      { "id": "b1", "type": "...", "text": "...", "align": "left|center|right|justify", "sizeTier": "large_heading|medium_heading|subheading|body|small", "color": "#RRGGBB or null", "marker": "1 (footnote blocks only)", "preserve": true/false }
+
+      TYPE options and when to use each:
+      - "heading" / "subheading": a title or section header, larger/bolder than body text
+      - "paragraph": ordinary body text
+      - "quote" / "citation" / "list_item": same body styling, but tagged for reference
+      - "footnote": a footnote/reference entry from the bottom of the page. MUST include a "marker" field with the exact reference number/symbol as printed (e.g. "1", "٢", "*") - do not renumber, do not convert its digit script.
+      - "image": a REAL visual element (photograph, diagram, chart, map, stamp, seal, logo, signature - NOT dense calligraphic text, NOT a decorative divider line, NOT stylized-but-still-readable heading text; if you can read it as a sentence, it's text, not an image). No "text" field needed for images, just its position in the block order.
+      - "url": a literal web address / domain name. Set "text" to the exact URL and "preserve": true.
+      - "icon": a small inline symbol/glyph that isn't a full image and isn't translatable text. Set "preserve": true.
+
+      ALIGNMENT: observe each block's actual alignment in the image (left/center/right/justify) rather than assuming.
+      SIZE TIER: judge each block's size RELATIVE to the page's own normal body text: "large_heading" (clearly the biggest element, e.g. a chapter title), "medium_heading" (clearly bigger than body but not the biggest), "subheading" (only slightly bigger/bolder than body), "body" (normal running text size), "small" (visibly smaller, e.g. footnotes/captions/fine print).
+      COLOR: only set a non-null color if the block is ACTUALLY colored in the source (e.g. a colored heading) - most blocks should have color: null and inherit the default styling downstream.
+      ${estimatedParagraphCount ? `A local structural scan estimates approximately ${estimatedParagraphCount} body paragraph(s) on this page - use this as a sanity check on your own paragraph segmentation, but trust your own visual reading if it clearly disagrees.` : ''}
+
+      --- INLINE TOKENS - MARK, DO NOT FORMAT ---
+      Two things need to be marked INSIDE a block's "text" field using plain-text tokens (NOT real HTML - a later step converts these, you only place them):
+      1. Where a footnote reference marker appears INSIDE body text (e.g. mid-sentence, referring to a footnote), insert the literal token ⟦FN:marker⟧ at that exact position, using the same marker value as the corresponding footnote block. Example: "...as reported¹" becomes "...as reported⟦FN:1⟧".
+      2. Where a word or phrase is visibly emphasized/highlighted in the source (bold+colored key terms, Quranic verse excerpts, etc), wrap just that span with ⟦HL⟧...⟦/HL⟧. Example: "the Prophet ﷺ said" with "said" emphasized becomes "the Prophet ﷺ ⟦HL⟧said⟧/HL⟧" (note: literally type ⟦/HL⟧ to close).
+      Do not use any other markup inside "text" fields - no HTML tags, only these two token types where they genuinely apply.
+
+      --- BOOK/WORK TITLES - MARK FOR PRESERVATION, DO NOT TRANSLATE THE TITLE ITSELF ---
+      If a footnote or citation names a specific book/published work, keep that title in the "text" field in its ORIGINAL script exactly as printed (a later step will preserve it, not translate it) - but you may still include surrounding words normally, since only the title portion will be protected from translation. Simplest approach: set "preserve": true on the whole footnote/citation block ONLY if it is entirely just a title/URL with nothing else to translate; otherwise leave preserve false and the title will still read correctly in the original text field.
+    `;
+
+    const extractionUserPrompt = `
+      PAGE TEXT LAYER (starting point - verify/correct against the image):
+      """
+      ${pageText || '(empty - rely on image)'}
+      """
+      Analyze this page now and output the JSON object described in the system message.
     `;
 
     try {
       const data = await callMistral([
-        { text: "Transcribe this page's text exactly as it appears." },
-        { inlineData: { mimeType: "image/jpeg", data: base64Image } }
-      ], ocrSystemPrompt);
+        { text: extractionUserPrompt },
+        ...(imagePayload ? [imagePayload] : [])
+      ], extractionSystemPrompt);
 
-      const ocrText = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
-      return (ocrText && !/^\[BLANK PAGE\]$/i.test(ocrText)) ? ocrText : pageText;
+      const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const parsed = parseJsonFromModelResponse(raw);
+      if (!parsed || !Array.isArray(parsed.blocks)) return null;
+      return parsed;
     } catch (e) {
-      console.warn("OCR pass failed, falling back to original extracted text:", e);
-      return pageText; // never let a failed OCR call block the main translation
+      console.error("Extraction (Phase A) call failed:", e);
+      throw e; // let the caller distinguish this from a Phase B failure
     }
   };
 
-  // v6 FIX 3: markers are now pre-extracted by our own code (buildFootnoteMetadata's
-  // regex) and handed to the model as structured data to substitute VERBATIM,
-  // rather than asking the model to re-parse the marker out of raw text itself
-  // (which was producing wrong numbers, e.g. renumbered/converted markers).
-  const translateFootnotesOnly = async (footnoteBlocks, targetCode) => {
-    if (!footnoteBlocks || footnoteBlocks.length === 0) return null;
-
+  // =============================================================================
+  // v7 PHASE B - "TRANSLATION": receives ONLY {id, text} pairs for translatable
+  // (non-preserve) blocks - no image, no formatting decisions. Its ONLY job is
+  // swapping original-language words for target-language words, leaving the two
+  // inline token types (⟦FN:..⟧ / ⟦HL⟧..⟦/HL⟧) exactly as given, untouched and
+  // unmoved - it does not decide WHERE emphasis or footnote references go, only
+  // translates the words around and inside them.
+  // =============================================================================
+  const runTranslationPhase = async (extraction, targetCode, glossaryList, structure) => {
     const targetName = TARGET_LABELS[targetCode];
-    const structuredFootnotes = footnoteBlocks.map((b, idx) => {
-      const m = (b.text || '').match(/^([\d١-٩۱-۹]{1,3}|[*†‡])[.\)]?\s*(.*)$/s);
-      return {
-        marker: m ? m[1] : String(idx + 1),
-        text: m ? m[2] : b.text
-      };
+    const glossaryExcerpt = buildGlossaryPromptExcerpt(glossaryList);
+    const repeatedMetadataHints = buildRepeatedMetadataPromptSection(structure, glossaryList);
+
+    const translatable = [];
+    (extraction.header?.lines || []).forEach(l => translatable.push({ id: `header:${l.id}`, text: l.text }));
+    (extraction.footer?.lines || []).forEach(l => translatable.push({ id: `footer:${l.id}`, text: l.text }));
+    (extraction.blocks || []).forEach(b => {
+      if (!b.preserve && b.type !== 'image' && typeof b.text === 'string') {
+        translatable.push({ id: b.id, text: b.text });
+      }
     });
 
-    const footnoteSystemPrompt = `
-      You are translating ONLY a page's footnote entries, in isolation - not the main body text, which is handled elsewhere.
+    if (translatable.length === 0) {
+      return { translationMap: {}, glossarySuggestions: [] };
+    }
 
-      For EACH footnote entry given in the user message, you are given its MARKER (the reference number/symbol) already extracted, separately from its TEXT. Use the given marker EXACTLY as provided, character for character, wrapped in <sup>...</sup> - do NOT re-derive it from the text yourself, do NOT renumber it, do NOT convert its digits to a different numeral script. Only translate the TEXT portion into ${targetName}.
+    const translationSystemPrompt = `
+      You translate ONLY the words given to you into ${targetName}. Every structural/visual decision (block type, alignment, size, position) has ALREADY been made by a separate step - you never see or need to make those decisions. Your entire job is: for each {id, text} entry given, produce {id, translatedText}.
+
+      ============================================================
+      RULE #1 - NO CONTENT SUBSTITUTION
+      ============================================================
+      Translate exactly the words given in each entry's "text" - never blend in wording from a different entry, even if they're topically related (e.g. a footnote entry and a nearby paragraph entry). Each entry is translated strictly from its own given text.
+
+      --- PRESERVE THESE TOKENS EXACTLY, UNTRANSLATED, UNMOVED ---
+      Some entries' text contains literal tokens: ⟦FN:marker⟧ (a footnote reference point) or ⟦HL⟧...⟦/HL⟧ (an emphasis span wrapper). These are NOT words to translate - copy them into your output EXACTLY as given, in the same relative position within the sentence, translating only the actual words around/inside them. Do not add, remove, or move these tokens.
+
+      --- BOOK/WORK TITLES - DO NOT TRANSLATE ---
+      If a specific book or published work's title appears in the text (e.g. "Sahih Al-Bukhari"), keep that title exactly as given in its original script/spelling - do not translate it, even though you translate the surrounding words normally.
 ${buildNumeralHandlingInstructions(targetCode)}
-      --- BOOK/WORK TITLES - PRESERVE ORIGINAL SCRIPT, DO NOT TRANSLATE ---
-      If a footnote names a specific book or published work (e.g. a citation like "Sahih Al-Bukhari" or an Arabic book title), preserve that title in its ORIGINAL script and spelling rather than translating it - a translated title doesn't help a reader locate the actual book. Wrap a preserved Arabic/Urdu-script title in <span dir="rtl" style="font-family: 'Scheherazade New', 'Noto Naskh Arabic', serif; unicode-bidi: embed;">...</span>. Wrap a preserved English/Latin-script title in <span style="font-family: 'Times New Roman', Times, serif;">...</span>. You may still translate surrounding words like "translated by" or "published by" normally - only the title itself stays in its original script/font.
+      ${glossaryExcerpt ? `--- APPROVED TERMINOLOGY GLOSSARY (reuse for consistency, unless context clearly requires otherwise) ---\n${glossaryExcerpt}\n` : ''}
+      ${repeatedMetadataHints ? `--- REPEATED HEADER/FOOTER WORDING - KEEP CONSISTENT ---\n${repeatedMetadataHints}\n` : ''}
 
-      --- WEB ADDRESSES - NEVER TRANSLATE OR ALTER ---
-      Any web address / URL / domain name (e.g. www.example.com, example.com/page) is a literal identifier, not narrative text - reproduce it character-for-character exactly as given, untouched.
-
-      Output format - wrap ALL footnotes in one block exactly like this, one <p> per footnote entry, nothing else. The alignment MUST be left (not center, not justify) regardless of how other elements on the page are aligned - footnotes are always left-aligned:
-      <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;"><p style="text-align: left; color: #64748B; font-size: 14px;"><sup>[marker]</sup> [translated footnote text, with any preserved title spans]</p>...</div>
-      Do not add commentary, do not use markdown code blocks, output raw HTML only.
+      Output ONLY a single JSON object (no markdown fences, no commentary), in exactly this shape:
+      {
+        "translations": [ { "id": "b1", "translatedText": "..." }, ... one entry per input id, same ids, same order ... ],
+        "glossarySuggestions": [ { "source": "...", "translated": "..." }, ... at most 8 important recurring terms from this page, or [] if none ... ]
+      }
     `;
-    const footnoteUserPrompt = `
-      SOURCE FOOTNOTE ENTRIES (marker already extracted - use it verbatim, only translate the text):
+
+    const translationUserPrompt = `
+      ENTRIES TO TRANSLATE:
       """
-${structuredFootnotes.map(f => `      MARKER: ${f.marker}\n      TEXT: ${f.text}`).join('\n\n')}
+${translatable.map(t => `      ID: ${t.id}\n      TEXT: ${t.text}`).join('\n\n')}
       """
-      Translate these into the footnotes HTML block described in the system message.
+      Translate every entry into ${targetName} and output the JSON object described in the system message.
     `;
 
     try {
-      const data = await callMistral([{ text: footnoteUserPrompt }], footnoteSystemPrompt);
-      const raw = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").replace(/```html|```/gi, '').trim();
-      return raw || null;
+      const data = await callMistral([{ text: translationUserPrompt }], translationSystemPrompt);
+      const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const parsed = parseJsonFromModelResponse(raw);
+      if (!parsed || !Array.isArray(parsed.translations)) return null;
+
+      const translationMap = {};
+      parsed.translations.forEach(t => {
+        if (t && t.id) translationMap[t.id] = t.translatedText || '';
+      });
+      const glossarySuggestions = Array.isArray(parsed.glossarySuggestions) ? parsed.glossarySuggestions : [];
+      return { translationMap, glossarySuggestions };
     } catch (e) {
-      console.warn("Dedicated footnote translation call failed:", e);
-      return null; // caller falls back gracefully - see merge step below
+      console.error("Translation (Phase B) call failed:", e);
+      throw e; // let the caller distinguish this from a Phase A failure
     }
   };
 
+  // v7 orchestrator: runs Phase A, then Phase B, then assembles via pure code
+  // (assemblePage - zero AI judgment). Returns which phase (if any) failed, so
+  // the caller can set a precise 'failed-phase-a' / 'failed-phase-b' status and
+  // persist whichever phase DID succeed - Retry only needs to redo the phase
+  // that actually failed, Retranslate only ever redoes Phase B.
   const translatePage = async (pageText, pageId, isPdf, structure = null, prevPageStructure = null, glossaryList = []) => {
-    // v5 CALL 3 (conditional): fix up the source text FIRST if it looks broken,
-    // so every subsequent call works from good text instead of garbage.
-    const effectivePageText = await runOcrIfNeeded(pageText, pageId, isPdf);
-
-    // v6 FIX 1: build a body-only version of the text with footnote-classified
-    // lines actually REMOVED (not just "please ignore this part"), so Call 1
-    // has no opportunity to translate the same footnote content that Call 2
-    // is independently translating - this is what was causing Page 8's
-    // duplicated content. Built from the same locally-classified blocks Call 2
-    // uses, so both calls agree on exactly what counts as "footnote" text.
-    const localFootnoteBlocks = (structure?.blocks || []).filter(b => b.type === 'footnote');
-    const ocrActuallyRan = effectivePageText !== pageText;
-    const bodyOnlyText = (!ocrActuallyRan && structure?.blocks && structure.blocks.length > 0)
-      ? structure.blocks.filter(b => b.type !== 'footnote').map(b => b.text).join(' ')
-      : effectivePageText; // OCR replaced the text, or no local structure available - block classification would be stale/unavailable, use the text as-is instead
-
-    // v6 FIX 8: concrete, checkable paragraph-count target instead of a vague
-    // "match the source" instruction.
-    const estimatedParagraphCount = estimateBodyParagraphCount(structure);
-
-    let imagePayload = null;
-    if (isPdf) {
-      const base64Image = await extractPageImageBase64(pageId);
-      if (base64Image) {
-        imagePayload = {
-          inlineData: {
-            mimeType: "image/jpeg",
-            data: base64Image
-          }
-        };
-      }
+    let extraction = null;
+    try {
+      extraction = await runExtraction(pageText, pageId, isPdf, structure, prevPageStructure);
+    } catch (e) {
+      return { phase: 'A', error: e, extraction: null, translationMap: null, html: '', glossarySuggestions: [] };
+    }
+    if (!extraction) {
+      return { phase: 'A', error: new Error('Extraction returned invalid/unparseable JSON.'), extraction: null, translationMap: null, html: '', glossarySuggestions: [] };
     }
 
-    const langInstruction = sourceLangMode === 'ar_ur'
-      ? "SOURCE LANGUAGE: Arabic / Urdu."
-      : sourceLangMode === 'en'
-      ? "SOURCE LANGUAGE: English."
-      : "SOURCE LANGUAGE: Auto-detect (Arabic, Urdu, or English).";
-
-    // PHASE 3: block-to-translation correspondence (item #9)
-    const blockMapSection = buildBlockMapPromptSection(structure);
-    // PHASE 3: small, targeted document-level context (item #21)
-    const contextSection = buildContextPromptSection(structure, prevPageStructure);
-    // PHASE 3: glossary excerpt for terminology consistency (item #20)
-    const glossaryExcerpt = buildGlossaryPromptExcerpt(glossaryList);
-    // PHASE 3: repeated header/footer consistency hint (item #14 behavior)
-    const repeatedMetadataHints = buildRepeatedMetadataPromptSection(structure, glossaryList);
-
-    const targetName = TARGET_LABELS[targetLang];
-
-    // PHASE 2: STABLE, page-independent rules go in the system message.
-    // PHASE 3 content improvements applied here:
-    //  - footnote handling moved up, directly after RULE #1 (earlier
-    //    instructions tend to get more reliable weighting than instructions
-    //    buried later in a long prompt), and its marker cross-check language
-    //    tightened further.
-    //  - text alignment: replaced fixed per-block-type defaults with an
-    //    instruction to observe and reproduce each block's actual alignment.
-    //  - font size: replaced fixed px values with a relative-size-tier
-    //    system keyed off the block's size relative to body text, so a
-    //    visually large heading and a merely-slightly-larger subheading
-    //    don't both get force-mapped to the same fixed 24px/20px values.
-    //  - visual scan: added explicit positive/negative examples to reduce
-    //    both missed real images (1.7) and dense decorative/calligraphic
-    //    text being mistaken for an image (1.8).
-    //  - paragraph mirroring: added an explicit output-count reminder.
-    const systemPrompt = `
-      READ A SOURCE PAGE (ARABIC / URDU / ENGLISH) AND PRODUCE ITS 100% MIRRORED ${targetName.toUpperCase()} TRANSLATION AS STYLED HTML, IN ONE SINGLE PASS.
-
-      ROLE: You are an expert scholarly translator. Your single most important job, above everything else in this prompt, is: translate exactly the sentence that is actually printed, in exactly the place it is printed, into faithful ${targetName} - never a different (even if related) sentence from elsewhere on the page.
-      ${langInstruction}
-
-      ============================================================
-      RULE #1 - THE MOST IMPORTANT RULE - NO CONTENT SUBSTITUTION (READ THIS FIRST, APPLY IT ABOVE ALL ELSE)
-      ============================================================
-      The source document contains dense, technical, citation-heavy academic/religious content (hadith science terminology, multi-narrator citation chains, scholarly argumentation). On pages like this, there is a known failure mode where a translator (human or AI) under cognitive load accidentally substitutes a DIFFERENT nearby sentence - often a quotation, footnote, or an adjacent paragraph discussing a related concept - in place of the sentence that was actually supposed to be translated at that position. This is a much more serious error than a wrong word choice: it silently replaces the meaning of an entire paragraph.
-      YOU MUST ACTIVELY GUARD AGAINST THIS. For every paragraph, before finalizing its ${targetName} translation, re-confirm: "Is this translation actually derived from THIS SPECIFIC paragraph's own words, or did I drift into translating a different quotation/footnote/paragraph that happens to be nearby and discusses a similar topic?" If you notice any drift, discard it and re-translate strictly from the actual source sentence at that position, even if the correct translation reads as less polished, less complete, or less like a "clean quotable passage" than the substituted version would have.
-      When a paragraph contains an embedded quotation (e.g. «...» or "..."), translate the quotation as part of that paragraph, in that exact position - do not let a quotation's content bleed into a neighboring paragraph, and do not let a neighboring paragraph's content bleed into the quotation.
-      This rule OVERRIDES any instinct to produce smoother-sounding or more "complete" ${targetName} text. A literal, faithful translation of the correct sentence is always better than a fluent translation of the wrong sentence.
-
-      ============================================================
-      RULE #1B - FOOTNOTE HANDLING (SPLIT RESPONSIBILITY - READ CAREFULLY)
-      ============================================================
-      This page's footnote text has ALREADY BEEN REMOVED from the "RAW TEXT CONTENT" you're given below, IF it was successfully detected by a local structural scan - it is translated separately by a different, dedicated call, not by you, so you will not normally see it at all.
-      Step 1: While translating the body text, keep every footnote reference marker (superscript number/symbol) exactly in place, in its exact original position, wrapped in <sup>...</sup> - the marker is a structural element and must survive into the translation (as a REFERENCE NUMBER, see numeral handling below).
-      Step 2: If the page visually has a footnote/reference block at the bottom (whether or not its text appears in what you were given), insert EXACTLY this placeholder ONCE, as the very LAST element in your entire output - after every other piece of content including any page number/footer text, since footnotes belong at the physical bottom of the page: <div class="footnotes-placeholder"></div>
-      Step 3: FALLBACK - if you can see small numbered reference/footnote text at the bottom of the page image that is NOT already covered by the placeholder in Step 2 (this means the local scan missed it and it's still present in what you were given), translate it yourself: wrap it in <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;"><p style="text-align: left; color: #64748B; font-size: 14px;"><sup>[marker]</sup> ...</p></div>, left-aligned, placed as the very last element. Do this ONLY if you can see footnote content that clearly isn't already accounted for by the placeholder - never produce both a placeholder AND your own footnotes div on the same page.
-      Step 4: If the page has no footnote block at all, do not insert anything footnote-related.
-
-      ${buildMixedDirectionInstructions(targetLang)}
-      ============================================================
-      RULE #2 - NEVER OUTPUT THE ORIGINAL-LANGUAGE TEXT
-      ============================================================
-      The original Arabic/Urdu/English source text must NEVER appear anywhere in your output as a substitute for translation - only the ${targetName} translation is the deliverable, even for the densest citation-chain passages. (See the MIXED DIRECTION section above for the narrow, explicitly-marked exception of a short embedded original-script liturgical quotation kept alongside its ${targetName} rendering - that is not "leaving text untranslated", it is a deliberate scholarly convention already called for elsewhere in this prompt.)
-
-      --- WEB ADDRESSES - NEVER TRANSLATE OR ALTER ---
-      Any web address / URL / domain name (e.g. www.example.com, example.com/page) is a literal identifier, not narrative text - reproduce it character-for-character exactly as given, untouched, never translated or transliterated.
-
-      --- IMAGE OCR & BLANK PAGE HANDLING ---
-      The page text given to you in the user message has already been through a text-layer extraction step (and a dedicated OCR correction pass, if the original extraction looked broken) - treat it as reliable. If it still looks incomplete for a specific passage, cross-reference the provided page image as a fallback.
-      If the image and text BOTH contain no readable content (a genuinely blank page), ignore all layout rules and output EXACTLY:
-      <p style="text-align: center; color: #94A3B8; font-style: italic; font-size: 16px; margin-top: 40px;">No Text Found</p>
-
-      --- LAYOUT FIDELITY (INCLUDING PARAGRAPH COUNT) ---
-      Preserve the EXACT paragraph breaks, lists, tables, and physical structure of the original page - do not re-order, combine, or split paragraphs, and do not summarize, omit, or add any text or meaning that isn't in the source. Only the LANGUAGE changes, to ${targetName}; the structure stays a 1:1 mirror.${estimatedParagraphCount ? ` A local structural scan estimates this page has approximately ${estimatedParagraphCount} body paragraph(s) - use this as a concrete target: output approximately ${estimatedParagraphCount} body <p> block(s), not noticeably more (artificially split) or fewer (artificially merged). This is a best-effort estimate from line spacing, not an absolute guarantee, so use your own visual judgment of the page if it clearly disagrees.` : ` If the source has 5 paragraphs, output 5 <p> blocks, not 3 merged ones and not 7 artificially split ones.`}
-
-      --- TRANSLATE EVERY VISIBLE TEXT ELEMENT - NO EXCEPTIONS ---
-      Every visible piece of text on the page must be translated, including running headers/footers, journal/publication names, issue numbers, dates, and page numbers (small metadata strips at the top/bottom included). Nothing is left in the original language anywhere on the page (outside the narrow embedded-quotation exception above, and the URL exception above).
-${buildNumeralHandlingInstructions(targetLang)}
-      --- NO INVENTED COMPLETIONS ---
-      If a sentence, heading, or list item appears cut off at the bottom of the page, translate it AS CUT OFF - do not invent a completion from your own knowledge (even of a well-known hadith/verse), and do not add trailing punctuation that wasn't in the source.
-
-      --- DEDICATED VISUAL SCAN STEP (DO THIS SEPARATELY FROM READING TEXT) ---
-      Visually scan the ENTIRE page image for any non-text visual element: photographs, diagrams, charts, graphs, maps, tables-as-images, illustrations, icons, stamps, seals, logos, letterheads, infographics, screenshots, decorative borders/dividers.
-      EXAMPLES OF THINGS THAT ARE REAL VISUAL ELEMENTS (mark these): a photograph or portrait; a hand-drawn or printed diagram/chart/map; a small circular or rectangular stamp/seal (often faint, monochrome, or near a title - do not mistake it for decorative heading styling); a publisher's logo/letterhead graphic; a scanned signature.
-      EXAMPLES OF THINGS THAT ARE NOT VISUAL ELEMENTS (do NOT mark these, just translate them as text): dense Arabic/Urdu calligraphic body text, even if visually ornate; a decorative horizontal rule/divider line with no image content; a bordered text box that only contains translatable words; a table of words/numbers (translate as an HTML table instead, if the table-handling rules elsewhere apply); large stylized heading text that is still just text, not a logo.
-      When genuinely uncertain whether something is a real graphic or just stylized text, look for it having no readable linguistic content of its own (a stamp/seal/logo typically has little to no independently readable sentence-level text) - if you can read it as a sentence, it's text, not an image.
-      For EACH real visual element found, output this EXACT HTML in its correct spatial place:
-      <div class="diagram-placeholder" style="border: 2px dashed #CBD5E1; padding: 20px; text-align: center; border-radius: 8px; margin: 16px 0; cursor: pointer;"><p style="font-size: 14px; color: #64748B; margin-bottom: 8px;">📤 Image Detected. Click here to upload replacement.</p></div>
-
-      --- BEAUTIFICATION & STYLING (INLINE CSS ONLY, OUTPUT IS ${targetName.toUpperCase()}) ---
-      Output text is always ${targetName}, and the page as a whole is always LTR (direction: ltr;) regardless of source direction - see MIXED DIRECTION above for the narrow local-span exception.
-
-      ALIGNMENT - observe, don't assume: for EVERY block, look at how it is actually aligned in the source image (left, center, right, or justified) and set text-align accordingly, rather than defaulting every heading to center and every body paragraph to justify regardless of the source. Only fall back to the defaults below (center for headings, justify for body) when the source's own alignment is genuinely ambiguous or the page has no reliable text-layer/image cue for it.
-
-      FONT SIZE - relative tier, not one fixed number: judge each block's size RELATIVE to that page's own body text size, then map it to the nearest tier below, rather than always using the same fixed px value regardless of how large the source heading actually looks:
-        - Tier "large heading" (source heading is clearly much bigger than body, e.g. a chapter/section title): font-size: 26px-28px
-        - Tier "medium heading" (clearly bigger than body but not the page's biggest element): font-size: 20px-22px
-        - Tier "subheading/emphasis line" (only slightly bigger or bolder than body): font-size: 18px-19px
-        - Tier "body" (the page's normal running text size): font-size: 16px-18px
-        - Tier "small/footnote" (visibly smaller than body, e.g. footnotes, captions, fine print): font-size: 13px-14px
-
-      1. Heading (large or medium tier per above): <p style="text-align: center; color: #4338CA; font-size: [26-28px large tier / 20-22px medium tier]; font-weight: bold; margin-bottom: 20px;">...</p> (use text-align per the ALIGNMENT guidance above, center is only the fallback default)
-      2. Subheading: <p style="color: #0F172A; font-size: [18-19px]; font-weight: bold; margin-bottom: 12px; border-bottom: 1px solid #E2E8F0; padding-bottom: 8px;">...</p>
-      3. Body text: <p style="text-align: [observed alignment, justify as fallback]; color: #334155; font-size: [16-18px]; line-height: 1.8; margin-bottom: 16px;">...</p>
-      4. Highlights: <span style="color: #BE123C; font-weight: bold;">...</span> for emphasis/Quranic verses/key terms.
-      5. Footnotes: NOT your responsibility here - see RULE #1B above, just insert the <div class="footnotes-placeholder"></div> marker if the page has footnotes, nothing more.
-      6. Preserve Quranic verses / Arabic religious terms with standard ${targetName} transliteration or brief explanation where appropriate.
-
-      DO NOT use markdown code blocks (\`\`\`html). Output raw styled HTML directly.
-
-      --- GLOSSARY SUGGESTIONS (APPEND AFTER THE HTML) ---
-      After the closing HTML, on a new line by itself, append a line in EXACTLY this format:
-      GLOSSARY_JSON:[{"source":"<original-language term>","translated":"<approved ${targetName} rendering>"}, ...]
-      List at most 8 important recurring proper nouns, names, or technical/religious terms from THIS page (if any) whose ${targetName} rendering should stay consistent if they reappear on later pages. If none are notable, output exactly: GLOSSARY_JSON:[]
-      This line must come AFTER all the HTML and must be the very last thing in your response.
-    `;
-
-    // PHASE 2: PAGE-SPECIFIC content only goes in the user message - the raw
-    // source text, this page's structural hints (block map/context/glossary/
-    // repeated-metadata), and the page image.
-    const userPrompt = `
-      ${blockMapSection ? `
-      --- SOURCE BLOCK MAP (BLOCK-TO-TRANSLATION CORRESPONDENCE) ---
-      The source page has been pre-segmented into the following structural blocks (id, type, and a short text snippet for identification only - always translate from the FULL source text/image, this snippet is just to locate the block). Use each block's OWN text as the sole source for its own translation - never let one block's content substitute for another's, especially between a "footnote"/"citation"/"quote" block and a nearby "paragraph" block. Where practical, mark the top-level HTML element you produce for each block with a matching data-block-id="<id>" attribute (in addition to its required inline style), so correspondence can be verified:
-${blockMapSection}
-` : ''}
-      ${contextSection ? `
-      --- DOCUMENT-LEVEL CONTEXT (FOR CONSISTENCY ONLY - DOES NOT REPLACE THIS PAGE'S OWN TEXT AS SOURCE OF TRUTH) ---
-${contextSection}
-` : ''}
-      ${glossaryExcerpt ? `
-      --- APPROVED TERMINOLOGY GLOSSARY (USE FOR CONSISTENCY - A HINT, NOT A FORCED SUBSTITUTION) ---
-      These ${targetName} renderings have already been used elsewhere in this document for the following source terms. Reuse them when the SAME term appears again with the SAME meaning, for consistency. If a term's correct meaning clearly differs in this new context, translate it correctly instead of forcing the glossary entry:
-${glossaryExcerpt}
-` : ''}
-      ${repeatedMetadataHints ? `
-      --- REPEATED HEADER/FOOTER TEXT - KEEP WORDING CONSISTENT ---
-      This document's structural scan detected that the following header/footer/publisher text repeats across multiple pages. Use the exact same ${targetName} wording shown below rather than re-wording it independently on this page:
-${repeatedMetadataHints}
-` : ''}
-
-      RAW TEXT CONTENT (extracted from the page's text layer, footnote text removed if locally detected - see RULE #1B, or corrected via a dedicated OCR pass if the original extraction looked broken):
-      """
-      ${bodyOnlyText}
-      """
-
-      Now translate this page following every rule given in the system message above.
-    `;
-
-    const data = await callMistral([
-      { text: userPrompt },
-      ...(imagePayload ? [imagePayload] : [])
-    ], systemPrompt);
-
-    let rawResponse = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").replace(/```html|```/gi, '').trim();
-
-    // PHASE 3: extract any trailing glossary suggestions before returning the
-    // cleaned HTML. Suggestions are handed back alongside the HTML so callers
-    // can merge them into the document glossary.
-    const { cleanedHtml, suggestions } = parseGlossarySuggestionsFromResponse(rawResponse);
-
-    // v5 CALL 2: translate footnotes in a separate, dedicated call using the
-    // LOCAL (non-AI) structure classifier's already-isolated footnote blocks.
-    // Skipped entirely (no API call) when the page has no footnote blocks.
-    const footnotesHtml = await translateFootnotesOnly(localFootnoteBlocks, targetLang);
-
-    let finalHtml = cleanedHtml;
-    if (footnotesHtml) {
-      if (finalHtml.includes('<div class="footnotes-placeholder"></div>')) {
-        // Normal case: Call 1 correctly left the placeholder - swap it in.
-        finalHtml = finalHtml.replace('<div class="footnotes-placeholder"></div>', footnotesHtml);
-      } else {
-        // Fallback: Call 1 forgot the placeholder despite instructions - never
-        // let Call 2's real, successfully-translated footnotes get silently
-        // dropped just because of that. Append them at the end instead.
-        finalHtml = finalHtml + footnotesHtml;
-      }
-    } else {
-      // No footnotes translated (either none exist, or Call 2 failed) - strip
-      // any leftover empty placeholder so it doesn't render as a stray element.
-      finalHtml = finalHtml.replace('<div class="footnotes-placeholder"></div>', '');
+    let translationResult = null;
+    try {
+      translationResult = await runTranslationPhase(extraction, targetLang, glossaryList, structure);
+    } catch (e) {
+      return { phase: 'B', error: e, extraction, translationMap: null, html: '', glossarySuggestions: [] };
+    }
+    if (!translationResult) {
+      return { phase: 'B', error: new Error('Translation returned invalid/unparseable JSON.'), extraction, translationMap: null, html: '', glossarySuggestions: [] };
     }
 
-    // PHASE 3: the previous blanket "force every direction:rtl / text-align:right
-    // to ltr" post-processing has been REMOVED here on purpose (per instructions:
-    // do not globally replace RTL with LTR anywhere). The page-level LTR
-    // requirement is now enforced only by the prompt above plus the existing
-    // outer container styling (contentEditable div and export wrapper both
-    // already force `direction: ltr` at the container level), which leaves
-    // room for legitimate local dir="rtl" spans inside the output.
-
-    return { html: finalHtml, glossarySuggestions: suggestions };
+    const html = assemblePage(extraction, translationResult.translationMap, targetLang);
+    return { phase: null, error: null, extraction, translationMap: translationResult.translationMap, html, glossarySuggestions: translationResult.glossarySuggestions };
   };
 
   // Verification & auto-correction pass.
-  const verifyAndCorrectTranslation = async (pageText, pageId, isPdf, translatedHtmlDraft, structure = null) => {
+  // v7 VERIFY - audits Phase A's extraction JSON only (never touches Phase B's
+  // translated text). Same completeness-first checklist philosophy as before,
+  // but the audit target is now the structural JSON, not assembled HTML -
+  // consistent with "Verify only for Phase A" from the plan. After a
+  // correction, the caller re-runs Phase B fresh against the corrected JSON
+  // (simpler and safer than trying to diff and re-translate only the changed
+  // blocks, at the cost of Phase B re-running in full on every Verify).
+  const verifyExtraction = async (pageText, pageId, isPdf, existingExtraction, structure = null) => {
     let imagePayload = null;
     if (isPdf) {
       const base64Image = await extractPageImageBase64(pageId);
       if (base64Image) {
-        imagePayload = {
-          inlineData: {
-            mimeType: "image/jpeg",
-            data: base64Image
-          }
-        };
+        imagePayload = { inlineData: { mimeType: "image/jpeg", data: base64Image } };
       }
     }
 
-    const verifyTargetName = TARGET_LABELS[targetLang];
     const verifyBlockMapSection = buildBlockMapPromptSection(structure);
-    const sourceFootnoteBlocks = (structure?.blocks || []).filter(b => b.type === 'footnote');
 
-    // PHASE 2 + v5 STRENGTHENED: audit checklist and output-format rules are
-    // stable regardless of which page is being checked - system message.
-    // COMPLETENESS is now checklist item #1 (elevated to top priority,
-    // above even content-substitution) because real testing showed pages
-    // losing entire trailing sections (closing paragraphs, signatures, and
-    // footnotes all missing at once) - a more severe failure than a
-    // mistranslated word, and one this audit pass was not explicitly
-    // checking for before. This is also the main safety net against the
-    // new footnote-specific API call (in the main translation pipeline)
-    // silently failing or returning nothing for a given page.
     const verifySystemPrompt = `
-      YOU ARE A PROOFREADER/AUDITOR, NOT A TRANSLATOR. Your job is to CHECK an existing ${verifyTargetName} translation against its original source page, and fix errors you find. Unlike a first-pass translation, thoroughness matters more than brevity here - take as much space as you need, and do not hesitate to substantially rebuild a section if you find it is genuinely missing or badly wrong, even though your default should still be to preserve parts that are already correct rather than rephrasing them for style.
+      YOU ARE A PROOFREADER/AUDITOR for a page-extraction JSON, not a translator. Your job is to CHECK an existing structural extraction (block types, text, alignment, size, color, header/footer lines, footnotes, images) against the original source page, and fix errors you find. Thoroughness matters more than brevity - take as much space as needed, and do not hesitate to add missing blocks entirely if you find real gaps.
 
-      Check specifically for these failure modes, IN THIS PRIORITY ORDER - completeness first, since missing content is the most severe and most common failure this audit exists to catch:
-
-      1. COMPLETENESS (CHECK THIS FIRST AND MOST CAREFULLY): compare the source page (text and image) against the translation HTML section by section, from the very top of the page to the very bottom, including the last paragraph before the page ends. Is there ANY sentence, paragraph, heading, signature line, credential line, or closing remark present in the source that has NO corresponding translated content anywhere in the HTML? Pay special attention to the END of the page - content just before a page cuts off is exactly what gets dropped when a response runs out of steam, so deliberately re-check the source's last 2-3 paragraphs specifically. If you find missing content, TRANSLATE IT YOURSELF NOW and insert it in the correct position in the HTML - do not just flag it, actually add it.
-      ${verifyBlockMapSection ? `
-      For reference, here is this page's source block map (id, type, short snippet) from local structural analysis - use it as a checklist to confirm every block has SOME corresponding translated content, especially block types other than "paragraph" (headings, quotes, citations) which are easier to accidentally skip:
-${verifyBlockMapSection}
-` : ''}
-      ${sourceFootnoteBlocks.length > 0 ? `
-      This page's source has ${sourceFootnoteBlocks.length} footnote block(s) detected by local analysis. The translation was generated with footnotes handled by a SEPARATE dedicated API call, which can occasionally fail or return nothing even when the main translation succeeds. Explicitly check: does the HTML contain a non-empty <div class="footnotes">...</div> block with translated content for all ${sourceFootnoteBlocks.length} footnote(s)? If it's missing, empty, or incomplete, translate the missing footnote(s) yourself now from this source footnote text and insert a proper <div class="footnotes" style="margin-top: 24px; border-top: 1px solid #E2E8F0; padding-top: 12px;">...</div> block with one <p style="color: #64748B; font-size: 14px;"> per footnote, in the correct position:
-${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
-` : ''}
-
-      2. CONTENT SUBSTITUTION: does each paragraph's ${verifyTargetName} actually correspond to THAT SAME paragraph's source text, or did content drift in from a nearby quotation, footnote, or adjacent paragraph discussing a related topic?
-      3. FACTUAL/NAME ACCURACY: are proper names, titles, and technical terms translated correctly and consistently - not swapped for a similar-sounding but different name or term (e.g. translating one scholar's name as if it were a different scholar's name)? Cross-check any name or title you're unsure of against how it's written in the source text/image.
-      4. HALLUCINATION / INVENTED COMPLETIONS: did the translation add words, sentences, or punctuation not present in the source - especially completing a sentence that was actually cut off at the bottom of the page?
-      5. FOOTNOTE MARKERS: does every footnote reference marker (superscript number/symbol) in the body have a matching footnote entry, and vice versa? Are footnotes kept in their own separate <div class="footnotes"> block rather than interleaved into body paragraphs?
-      6. ORIGINAL-LANGUAGE LEFTOVERS: does any Arabic/Urdu/English text remain anywhere in the output that should have been translated to ${verifyTargetName} (outside a deliberately marked, narrow embedded-quotation exception)? Watch specifically for a foreign-language phrase left untranslated in the middle of an otherwise-translated sentence (e.g. wrapped in an emphasis/highlight span instead of actually being translated).
-      7. VISUAL ELEMENT PLACEHOLDERS: compare the page image (if provided) against the HTML - is any photograph, diagram, chart, graph, map, table-as-image, illustration, icon, stamp, seal, or logo visible on the page missing its placeholder <div class="diagram-placeholder">...</div> block? Conversely, was any purely decorative/calligraphic text or divider line incorrectly turned into a placeholder when it should have just been translated as text?
-      8. HEADERS/FOOTERS/PAGE NUMBERS: is every peripheral text element (running header/footer, journal name, issue number, date, page number) fully translated to ${verifyTargetName}, using narrative-numeral conventions rather than reference-numeral ones?
-      9. NUMERAL HANDLING: were any REFERENCE numbers (footnote markers, citation numbers, page/volume/issue numbers used as identifiers) incorrectly converted or reformatted when they should have been preserved exactly as identifiers?
-      10. PARAGRAPH COUNT: does the number of body <p> blocks in the translation roughly match the number of distinct paragraphs in the source (not artificially merged or split)?
-      11. ALIGNMENT & SIZE FIDELITY: does each block's text-align and relative font-size roughly reflect what's actually observed in the source image, rather than every heading being force-centered and every body paragraph force-justified regardless of the source?
+      Check specifically, IN THIS PRIORITY ORDER:
+      1. COMPLETENESS (CHECK FIRST, MOST CAREFULLY): compare the source page (text and image) against the JSON's blocks, from the very top to the very bottom, INCLUDING the last 2-3 paragraphs/lines before the page ends - that's exactly where content most often gets silently dropped. Is there any sentence, paragraph, heading, signature line, or footnote present in the source with NO corresponding block in the JSON? If so, ADD the missing block(s) now, in the correct position.
+      ${verifyBlockMapSection ? `Reference - local structural scan's own block map, as a cross-check:\n${verifyBlockMapSection}\n` : ''}
+      2. FOOTNOTE MARKERS: does every footnote block have the correct "marker" value exactly as printed in the source (not renumbered, not digit-converted)? Does every inline ⟦FN:marker⟧ token in body text have a matching footnote block with that same marker?
+      3. TYPE ACCURACY: is any block mis-typed - e.g. a real image marked as a paragraph, or dense decorative text incorrectly marked as an "image" block?
+      4. ALIGNMENT & SIZE: does each block's "align" and "sizeTier" roughly match what's actually observed in the source image?
+      5. INLINE TOKENS: are ⟦HL⟧...⟦/HL⟧ emphasis spans correctly placed around genuinely emphasized/highlighted source text, not missing or misplaced?
+      6. HEADER/FOOTER/PAGE NUMBER: are all header lines, footer lines, and the page number captured, each with correct text/alignment?
 
       OUTPUT RULES:
-      - If you find NO issues after checking all eleven points above, respond with EXACTLY this sentinel text and nothing else: NO_CORRECTIONS_NEEDED
-      - If you find ANY issue, respond with the FULL corrected HTML (same format/styling conventions as the input - styled <p>/<div>/<span> tags, ${verifyTargetName} text, page-level LTR direction with only narrow local dir="rtl" spans where explicitly appropriate), with the errors fixed AND any missing content from point 1 actually added in. Preserve parts that were already correct rather than rephrasing them for style, but do not let that caution stop you from adding substantial missing content when point 1 finds it.
-      - Do not use markdown code blocks. Output either the sentinel text alone, or raw HTML alone - never both, never any other commentary.
+      - If you find NO issues after checking all six points, respond with EXACTLY this sentinel text and nothing else: NO_CORRECTIONS_NEEDED
+      - If you find ANY issue, respond with the FULL corrected JSON object, in the exact same shape as the input JSON (pageNumber, header, footer, blocks, paragraphCount), with the errors fixed and any missing blocks added. Preserve blocks that were already correct unchanged.
+      - Output ONLY the sentinel text alone, or raw JSON alone (no markdown fences) - never both, never any other commentary.
     `;
 
-    // PHASE 2: page-specific content only - the actual source text and draft
-    // translation being audited.
     const verifyUserPrompt = `
-      ORIGINAL SOURCE PAGE TEXT (Arabic / Urdu / English - also see attached page image if provided):
+      ORIGINAL SOURCE PAGE TEXT (also see attached page image if provided):
       """
       ${pageText}
       """
 
-      EXISTING ${verifyTargetName.toUpperCase()} TRANSLATION HTML TO AUDIT:
+      EXISTING EXTRACTION JSON TO AUDIT:
       """
-      ${translatedHtmlDraft}
+      ${JSON.stringify(existingExtraction)}
       """
 
-      Audit this translation against the source following every checklist item and output rule given in the system message above.
+      Audit this extraction against the source following the checklist in the system message.
     `;
 
     try {
@@ -1779,19 +1790,17 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
         ...(imagePayload ? [imagePayload] : [])
       ], verifySystemPrompt);
 
-      let rawText = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").replace(/```html|```/gi, '').trim();
+      const rawText = (data.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
 
       if (!rawText || /^NO_CORRECTIONS_NEEDED$/i.test(rawText)) {
-        return translatedHtmlDraft;
+        return existingExtraction; // no changes needed
       }
 
-      // PHASE 3: blanket RTL->LTR force-replacement removed here too, for the
-      // same reason as in translatePage - see comment there.
-
-      return rawText;
+      const corrected = parseJsonFromModelResponse(rawText);
+      return (corrected && Array.isArray(corrected.blocks)) ? corrected : existingExtraction;
     } catch (e) {
-      console.error("Verification error:", e);
-      return translatedHtmlDraft;
+      console.error("Extraction verification error:", e);
+      return existingExtraction; // never lose the existing good extraction on a failed audit call
     }
   };
 
@@ -1824,19 +1833,32 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
         )));
 
         let translatedHtmlResult = null;
+        let extractionResult = null;
+        let translatedBlocksResult = null;
         let failureReason = null;
+        let failedPhase = null;
+
         try {
           const result = await translatePage(rawText, pageId, isPdf, structure, prevPageStructure, glossaryRef.current);
-          const validation = validateTranslationResult(result.html, rawText);
-          if (validation.valid) {
-            translatedHtmlResult = result.html;
-            // PHASE 3: merge this page's glossary suggestions immediately so
-            // subsequent pages in this same batch see them via glossaryRef.
-            const merged = mergeGlossaryEntries(glossaryRef.current, result.glossarySuggestions);
-            glossaryRef.current = merged;
-            setGlossary(merged);
+          extractionResult = result.extraction; // may be non-null even if Phase B failed - keep it either way
+
+          if (result.phase) {
+            // A phase genuinely failed to produce usable output (API error or
+            // unparseable JSON) - distinct from "produced output, but it
+            // looked wrong", which validateTranslationResult catches below.
+            failedPhase = result.phase;
+            failureReason = result.error?.message || `Phase ${result.phase} failed.`;
           } else {
-            failureReason = validation.reason;
+            const validation = validateTranslationResult(result.html, rawText);
+            if (validation.valid) {
+              translatedHtmlResult = result.html;
+              translatedBlocksResult = result.translationMap;
+              const merged = mergeGlossaryEntries(glossaryRef.current, result.glossarySuggestions);
+              glossaryRef.current = merged;
+              setGlossary(merged);
+            } else {
+              failureReason = validation.reason;
+            }
           }
         } catch (e) {
           console.error("Translation error:", e);
@@ -1856,13 +1878,20 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
           if (translatedHtmlResult) {
             return {
               ...s,
+              extraction: extractionResult,
+              translatedBlocks: translatedBlocksResult,
               translatedHtml: translatedHtmlResult,
               originalTranslatedHtml: s.originalTranslatedHtml || translatedHtmlResult,
               translationStatus: 'done',
               translationError: null
             };
           }
-          return { ...s, translationStatus: 'error', translationError: failureReason };
+          return {
+            ...s,
+            extraction: extractionResult || s.extraction, // keep Phase A's result even if Phase B failed
+            translationStatus: failedPhase === 'A' ? 'failed-phase-a' : failedPhase === 'B' ? 'failed-phase-b' : 'error',
+            translationError: failureReason
+          };
         }));
       }
 
@@ -1873,36 +1902,96 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
     setSuccessMsg("Batch translation complete!");
   };
 
-  const handleVerifyPage = async (pageId) => {
+  // v7 VERIFY - Phase A only. Audits/corrects the extraction JSON, then
+  // re-runs Phase B fresh against the corrected structure (Phase B is cheap
+  // and this avoids the complexity/risk of trying to only re-translate the
+  // specific blocks that changed).
+  const handleVerifyExtraction = async (pageId) => {
     const page = parsedSections.find(s => s.id === pageId);
-    if (!page || !page.translatedHtml) return;
+    if (!page || !page.extraction) return;
 
     setErrorMsg(null);
     setSuccessMsg(null);
+    setParsedSections(prev => prev.map(s => (s.id === pageId ? { ...s, translationStatus: 'verifying' } : s)));
 
-    setParsedSections(prev => prev.map(s => (
-      s.id === pageId ? { ...s, translationStatus: 'verifying' } : s
-    )));
+    try {
+      const correctedExtraction = await verifyExtraction(page.content.rawText, page.id, page.isPdf, page.extraction, page.structure);
+      const translationResult = await runTranslationPhase(correctedExtraction, targetLang, glossaryRef.current, page.structure);
+      const finalHtml = assemblePage(correctedExtraction, translationResult?.translationMap || {}, targetLang);
 
-    const finalHtml = await verifyAndCorrectTranslation(page.content.rawText, page.id, page.isPdf, page.translatedHtml, page.structure);
+      if (translationResult?.glossarySuggestions?.length) {
+        const merged = mergeGlossaryEntries(glossaryRef.current, translationResult.glossarySuggestions);
+        glossaryRef.current = merged;
+        setGlossary(merged);
+      }
 
-    setParsedSections(prev => prev.map(s => (
-      s.id === pageId
-        ? {
-            ...s,
-            translatedHtml: finalHtml,
-            originalTranslatedHtml: s.originalTranslatedHtml || finalHtml,
-            translationStatus: 'done'
-          }
-        : s
-    )));
-    setSuccessMsg(`Section ${pageId} verified successfully!`);
+      setParsedSections(prev => prev.map(s => (
+        s.id === pageId
+          ? {
+              ...s,
+              extraction: correctedExtraction,
+              translatedBlocks: translationResult?.translationMap || s.translatedBlocks,
+              translatedHtml: finalHtml,
+              originalTranslatedHtml: s.originalTranslatedHtml || finalHtml,
+              translationStatus: 'done'
+            }
+          : s
+      )));
+      setSuccessMsg(`Section ${pageId} extraction verified successfully!`);
+    } catch (e) {
+      console.error("Extraction verification failed:", e);
+      setErrorMsg(`Verify failed: ${e.message}`);
+      setParsedSections(prev => prev.map(s => (s.id === pageId ? { ...s, translationStatus: 'done' } : s)));
+    }
   };
 
-  // PHASE 3: retry now also passes this page's structure, the previous
-  // page's structure (looked up by id-1 from current parsedSections, since a
-  // retry happens outside the batch loop), and the current glossary, then
-  // merges any new glossary suggestions the same way the batch loop does.
+  // v7 RETRANSLATE - Phase B only. Reuses the already-stored Phase A
+  // extraction unchanged - no image, no re-extraction, much cheaper/faster
+  // than a full page redo. Useful specifically when the STRUCTURE was fine
+  // but the WORDS came out wrong.
+  const handleRetranslate = async (pageId) => {
+    const page = parsedSections.find(s => s.id === pageId);
+    if (!page || !page.extraction) return;
+
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    setParsedSections(prev => prev.map(s => (s.id === pageId ? { ...s, translationStatus: 'retranslating' } : s)));
+
+    try {
+      const translationResult = await runTranslationPhase(page.extraction, targetLang, glossaryRef.current, page.structure);
+      if (!translationResult) throw new Error("Translation returned invalid/unparseable JSON.");
+
+      const finalHtml = assemblePage(page.extraction, translationResult.translationMap, targetLang);
+      const merged = mergeGlossaryEntries(glossaryRef.current, translationResult.glossarySuggestions);
+      glossaryRef.current = merged;
+      setGlossary(merged);
+
+      setParsedSections(prev => prev.map(s => (
+        s.id === pageId
+          ? {
+              ...s,
+              previousTranslatedHtml: s.translatedHtml || s.previousTranslatedHtml,
+              translatedBlocks: translationResult.translationMap,
+              translatedHtml: finalHtml,
+              originalTranslatedHtml: s.originalTranslatedHtml || finalHtml,
+              translationStatus: 'done',
+              translationError: null
+            }
+          : s
+      )));
+      setSuccessMsg(`Section ${pageId} retranslated successfully!`);
+    } catch (e) {
+      console.error("Retranslate failed:", e);
+      setErrorMsg(`Retranslate failed: ${e.message}`);
+      setParsedSections(prev => prev.map(s => (s.id === pageId ? { ...s, translationStatus: 'done' } : s)));
+    }
+  };
+
+  // v7 RETRY - phase-aware: only redoes whichever phase actually failed.
+  // If Phase A never succeeded (no stored extraction), retries BOTH phases
+  // via the full translatePage orchestrator. If Phase A already succeeded
+  // but Phase B failed, retries ONLY Phase B against the existing extraction
+  // - cheaper and faster, and never re-does work that already succeeded.
   const handleRetryPage = async (pageId) => {
     const page = parsedSections.find(s => s.id === pageId);
     if (!page) return;
@@ -1910,13 +1999,52 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
 
     setErrorMsg(null);
     setSuccessMsg(null);
-
     setParsedSections(prev => prev.map(s => (
       s.id === pageId ? { ...s, translationStatus: 'loading', translationError: null } : s
     )));
 
+    // Phase A already has a usable extraction stored - only Phase B needs retrying.
+    if (page.extraction && page.translationStatus === 'failed-phase-b') {
+      try {
+        const translationResult = await runTranslationPhase(page.extraction, targetLang, glossaryRef.current, page.structure);
+        if (!translationResult) throw new Error("Translation returned invalid/unparseable JSON.");
+        const finalHtml = assemblePage(page.extraction, translationResult.translationMap, targetLang);
+        const merged = mergeGlossaryEntries(glossaryRef.current, translationResult.glossarySuggestions);
+        glossaryRef.current = merged;
+        setGlossary(merged);
+
+        setParsedSections(prev => prev.map(s => (
+          s.id === pageId
+            ? {
+                ...s,
+                translatedBlocks: translationResult.translationMap,
+                translatedHtml: finalHtml,
+                originalTranslatedHtml: s.originalTranslatedHtml || finalHtml,
+                translationStatus: 'done',
+                translationError: null,
+                retryCount: (s.retryCount || 0) + 1
+              }
+            : s
+        )));
+        setSuccessMsg(`Section ${pageId} retried successfully (Phase B only)!`);
+      } catch (e) {
+        console.error("Retry (Phase B) failed:", e);
+        const msg = `Retry failed: ${e.message}`;
+        setErrorMsg(msg);
+        setParsedSections(prev => prev.map(s => (
+          s.id === pageId ? { ...s, translationStatus: 'failed-phase-b', translationError: msg, retryCount: (s.retryCount || 0) + 1 } : s
+        )));
+      }
+      return;
+    }
+
+    // Otherwise (Phase A never succeeded, or a non-phase-specific error like
+    // NO_API_KEY) - full retry of both phases via the normal orchestrator.
     let translatedHtmlResult = null;
+    let extractionResult = null;
+    let translatedBlocksResult = null;
     let failureReason = null;
+    let failedPhase = null;
     try {
       const result = await translatePage(
         page.content.rawText,
@@ -1926,14 +2054,22 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
         prevPage?.structure || null,
         glossaryRef.current
       );
-      const validation = validateTranslationResult(result.html, page.content.rawText);
-      if (validation.valid) {
-        translatedHtmlResult = result.html;
-        const merged = mergeGlossaryEntries(glossaryRef.current, result.glossarySuggestions);
-        glossaryRef.current = merged;
-        setGlossary(merged);
+      extractionResult = result.extraction;
+
+      if (result.phase) {
+        failedPhase = result.phase;
+        failureReason = result.error?.message || `Phase ${result.phase} failed.`;
       } else {
-        failureReason = validation.reason;
+        const validation = validateTranslationResult(result.html, page.content.rawText);
+        if (validation.valid) {
+          translatedHtmlResult = result.html;
+          translatedBlocksResult = result.translationMap;
+          const merged = mergeGlossaryEntries(glossaryRef.current, result.glossarySuggestions);
+          glossaryRef.current = merged;
+          setGlossary(merged);
+        } else {
+          failureReason = validation.reason;
+        }
       }
     } catch (e) {
       console.error("Retry translation error:", e);
@@ -1954,6 +2090,8 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
         return {
           ...s,
           previousTranslatedHtml: s.translatedHtml || s.previousTranslatedHtml,
+          extraction: extractionResult,
+          translatedBlocks: translatedBlocksResult,
           translatedHtml: translatedHtmlResult,
           originalTranslatedHtml: s.originalTranslatedHtml || translatedHtmlResult,
           translationStatus: 'done',
@@ -1961,7 +2099,13 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
           retryCount: (s.retryCount || 0) + 1
         };
       }
-      return { ...s, translationStatus: 'error', translationError: failureReason, retryCount: (s.retryCount || 0) + 1 };
+      return {
+        ...s,
+        extraction: extractionResult || s.extraction,
+        translationStatus: failedPhase === 'A' ? 'failed-phase-a' : failedPhase === 'B' ? 'failed-phase-b' : 'error',
+        translationError: failureReason,
+        retryCount: (s.retryCount || 0) + 1
+      };
     }));
 
     if (translatedHtmlResult) {
@@ -2744,7 +2888,14 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
                               {s.meta.partName}
                             </span>
                             <span className="text-[9px] text-slate-400 block leading-tight font-semibold">
-                              {s.translationStatus === 'idle' ? 'Not Processed' : s.translationStatus === 'loading' ? 'Translating...' : s.translationStatus === 'verifying' ? 'Verifying...' : s.translationStatus === 'error' ? 'Failed' : 'Translated'}
+                              {s.translationStatus === 'idle' ? 'Not Processed'
+                                : s.translationStatus === 'loading' ? 'Translating...'
+                                : s.translationStatus === 'verifying' ? 'Verifying Extraction...'
+                                : s.translationStatus === 'retranslating' ? 'Retranslating...'
+                                : s.translationStatus === 'failed-phase-a' ? 'Extraction Failed'
+                                : s.translationStatus === 'failed-phase-b' ? 'Translation Failed'
+                                : s.translationStatus === 'error' ? 'Failed'
+                                : 'Translated'}
                             </span>
                           </div>
                         </div>
@@ -2753,17 +2904,20 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
                           {s.translationStatus === 'done' && (
                             <span className="w-2 h-2 rounded-full bg-emerald-500" title="Translated" />
                           )}
-                          {(s.translationStatus === 'loading' || s.translationStatus === 'verifying') && (
+                          {(s.translationStatus === 'loading' || s.translationStatus === 'verifying' || s.translationStatus === 'retranslating') && (
                             <Loader2 size={12} className="animate-spin text-indigo-500" />
                           )}
-                          {s.translationStatus === 'error' && (
+                          {(s.translationStatus === 'error' || s.translationStatus === 'failed-phase-a' || s.translationStatus === 'failed-phase-b') && (
                             <span className="w-2 h-2 rounded-full bg-red-500" title="Failed" />
                           )}
                           <ChevronRight size={14} className={isActive ? 'text-indigo-400' : 'text-slate-300'} />
                         </div>
                       </div>
 
-                      {s.translationStatus === 'error' && (
+                      {/* v7 RETRY - only appears on an actual API/parse failure (not a
+                          quality issue - that's what Verify/Retranslate are for). Label
+                          reflects which phase actually failed, since that's all Retry redoes. */}
+                      {(s.translationStatus === 'error' || s.translationStatus === 'failed-phase-a' || s.translationStatus === 'failed-phase-b') && (
                         <div className="mt-2 pl-10 pr-1">
                           <button
                             onClick={(e) => {
@@ -2771,32 +2925,43 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
                               setActiveSectionId(s.id);
                               handleRetryPage(s.id);
                             }}
-                            title="Retry this page only (Ministral 3 14B)"
+                            title={s.translationStatus === 'failed-phase-b' ? "Retry Phase B only (structure is already fine, just retranslate)" : "Retry this page (both phases)"}
                             className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg bg-red-50 border border-red-200 text-red-600 hover:bg-red-100 transition-all cursor-pointer text-[10px] font-bold"
                           >
                             <RotateCcw size={11} />
-                            <span>Retry Page {s.id}</span>
+                            <span>{s.translationStatus === 'failed-phase-b' ? `Retry Phase B - Page ${s.id}` : `Retry Page ${s.id}`}</span>
                           </button>
                         </div>
                       )}
 
-                      {s.translationStatus !== 'idle' && s.translationStatus !== 'error' && (
+                      {s.translationStatus === 'done' && (
                         <div className="mt-2.5 pl-10 pr-1 flex items-center gap-1.5">
+                          {/* v7 VERIFY - Phase A (extraction) only */}
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
                               setActiveSectionId(s.id);
-                              handleVerifyPage(s.id);
+                              handleVerifyExtraction(s.id);
                             }}
-                            disabled={s.translationStatus === 'loading' || s.translationStatus === 'verifying' || !s.translatedHtml}
-                            title={`Verify & auto-correct (Ministral 3 14B, 1 API request, ${REQUEST_INTERVAL_MS / 1000}s gap)`}
+                            disabled={s.translationStatus !== 'done' || !s.extraction}
+                            title={`Verify Extraction - Phase A only (Ministral 3 14B, ~2 API requests: audit + retranslate, ${REQUEST_INTERVAL_MS / 1000}s gap)`}
                             className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-400 hover:text-indigo-600 hover:border-indigo-300 hover:bg-indigo-50 transition-all cursor-pointer disabled:opacity-50 shrink-0"
                           >
-                            {s.translationStatus === 'verifying' ? (
-                              <Loader2 size={12} className="animate-spin" />
-                            ) : (
-                              <ShieldCheck size={12} />
-                            )}
+                            <ShieldCheck size={12} />
+                          </button>
+
+                          {/* v7 RETRANSLATE - Phase B only, reuses stored extraction */}
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActiveSectionId(s.id);
+                              handleRetranslate(s.id);
+                            }}
+                            disabled={s.translationStatus !== 'done' || !s.extraction}
+                            title={`Retranslate - Phase B only, reuses existing extraction (no image, cheaper/faster, ${REQUEST_INTERVAL_MS / 1000}s gap)`}
+                            className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-400 hover:text-amber-600 hover:border-amber-300 hover:bg-amber-50 transition-all cursor-pointer disabled:opacity-50 shrink-0"
+                          >
+                            <Languages size={12} />
                           </button>
 
                           <button
@@ -2804,24 +2969,11 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
                               e.stopPropagation();
                               handleResetTranslation(s.id);
                             }}
-                            disabled={s.translationStatus === 'loading' || s.translationStatus === 'verifying' || !s.originalTranslatedHtml}
+                            disabled={s.translationStatus !== 'done' || !s.originalTranslatedHtml}
                             title="Reset to Original Translation (no API request)"
                             className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-400 hover:text-purple-600 hover:border-purple-300 hover:bg-purple-50 transition-all cursor-pointer disabled:opacity-50 shrink-0"
                           >
                             <Sparkles size={12} />
-                          </button>
-
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setActiveSectionId(s.id);
-                              handleRetryPage(s.id);
-                            }}
-                            disabled={s.translationStatus === 'loading' || s.translationStatus === 'verifying'}
-                            title="Retry / retranslate this page (previous result is preserved)"
-                            className="p-1.5 rounded-lg bg-white border border-slate-200 text-slate-400 hover:text-amber-600 hover:border-amber-300 hover:bg-amber-50 transition-all cursor-pointer disabled:opacity-50 shrink-0"
-                          >
-                            <RotateCcw size={12} />
                           </button>
                         </div>
                       )}
@@ -3018,12 +3170,12 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
                           </div>
                         )}
 
-                        {activePage.translationStatus === 'loading' && reviewMode === 'target' && (
+                        {(activePage.translationStatus === 'loading' || activePage.translationStatus === 'retranslating') && reviewMode === 'target' && (
                           <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-3">
                             <div className="w-8 h-8 border-3 border-indigo-100 rounded-full animate-spin border-t-indigo-600"></div>
                             <div className="space-y-1">
-                              <p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Translating to {targetLabel}...</p>
-                              <p className="text-[10px] text-slate-400">Mirroring document structure, style, and terminology</p>
+                              <p className="text-xs font-bold text-slate-500 uppercase tracking-widest">{activePage.translationStatus === 'retranslating' ? `Retranslating to ${targetLabel}...` : `Translating to ${targetLabel}...`}</p>
+                              <p className="text-[10px] text-slate-400">{activePage.translationStatus === 'retranslating' ? 'Phase B only - reusing the existing page structure' : 'Phase A: reading structure, then Phase B: translating'}</p>
                             </div>
                           </div>
                         )}
@@ -3032,17 +3184,19 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
                           <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-3">
                             <div className="w-8 h-8 border-3 border-indigo-100 rounded-full animate-spin border-t-indigo-600"></div>
                             <div className="space-y-1">
-                              <p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Verifying & Correcting...</p>
-                              <p className="text-[10px] text-slate-400">Auditing the translation against the original source</p>
+                              <p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Verifying Extraction...</p>
+                              <p className="text-[10px] text-slate-400">Auditing the page structure (Phase A) against the original source</p>
                             </div>
                           </div>
                         )}
 
-                        {activePage.translationStatus === 'error' && reviewMode === 'target' && (
+                        {(activePage.translationStatus === 'error' || activePage.translationStatus === 'failed-phase-a' || activePage.translationStatus === 'failed-phase-b') && reviewMode === 'target' && (
                           <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-2">
                             <AlertCircle size={28} className="text-red-500" />
                             <div className="max-w-xs space-y-1">
-                              <h4 className="text-xs font-bold text-slate-800">Translation Failed</h4>
+                              <h4 className="text-xs font-bold text-slate-800">
+                                {activePage.translationStatus === 'failed-phase-a' ? 'Extraction Failed (Phase A)' : activePage.translationStatus === 'failed-phase-b' ? 'Translation Failed (Phase B)' : 'Translation Failed'}
+                              </h4>
                               <p className="text-[11px] text-slate-400">
                                 {activePage.translationError || `Error translating content to ${targetLabel}. Please retry.`}
                               </p>
@@ -3052,7 +3206,7 @@ ${sourceFootnoteBlocks.map(b => `      - [${b.id}] ${b.text}`).join('\n')}
                               className="mt-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold flex items-center gap-2 transition-all shadow-sm cursor-pointer"
                             >
                               <RotateCcw size={13} />
-                              <span>Retry This Page</span>
+                              <span>{activePage.translationStatus === 'failed-phase-b' ? 'Retry Phase B Only' : 'Retry This Page'}</span>
                             </button>
                           </div>
                         )}
